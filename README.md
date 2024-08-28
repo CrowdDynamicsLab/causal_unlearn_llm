@@ -15,4 +15,5 @@ Notes:
 For William:
 
 - Refer to the `RealToxicityPrompts` paper to determine which model they used and pick one of the GPT-2 variants to run `ROME` with the prompts from the dataset.
+- Choose the "challenging" subset of prompts, i.e., where `dataset["challenging"] == true`
 - For our use case, right now just the causal tracing part is enough, we don't need to worry about the editing part yet.
