@@ -10,7 +10,7 @@ Notes:
 
 - The entire codebase for `ROME` can be found in the directory `rome-main`. Cloned from [Locating and Editing Factual Associations in GPT (NeurIPS'22)](https://arxiv.org/pdf/2202.05262).
 - The `rome-main/trace_main.py` is the main script to run a vanilla example of causal tracing on one of the datasets in the original paper.
-- The directory `rome-main/dsets` contains the datasets they use. This is where we need to add the `RealToxicityPrompts` dataset and load it from for inference.
+- The directory `rome-main/dsets` contains the datasets they use. This is where we need to add the `RealToxicityPrompts` dataset and load it from for inference. It is present in the file `rome-main/dsets/realtoxicityprompts.py`
 
 For William:
 
