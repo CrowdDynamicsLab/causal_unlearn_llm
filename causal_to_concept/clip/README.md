@@ -1,0 +1,1 @@
+This is the code to run the multimodal CLIP experiments in the paper ```From Causal to Concept-Based Representation Learning```
