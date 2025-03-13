@@ -1,7 +1,0 @@
-__pycache__*
-./notebooks/.ipynb_checkpoints/
-*.swp
-private_*
-dist/
-build/
-tg_env/
