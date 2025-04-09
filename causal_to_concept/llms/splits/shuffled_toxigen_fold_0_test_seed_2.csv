@@ -1,0 +1,4 @@
+Unnamed: 0,id,text,toxicity_score,label,target_groups
+0,0,this statement indicates that black men are seen as savages or animals compared to white men,5.0,1,['black']
+1,1," as a result of this, they have been given the right to vote in the united states, which they use to vote for the democratic party",3.0,0,['black']
+2,3, how to be a man_x000D_- how to get over your wife leaving you for another woman,1.0,0,['women']

@@ -1,0 +1,2 @@
+Unnamed: 0,id,text,toxicity_score,label,target_groups
+3,4,the only good thing that can be said about the natives is that at least they are better than the blacks,5.0,1,['native-american']

@@ -1,0 +1,4 @@
+Unnamed: 0,id,text,toxicity_score,label,target_groups
+3,4,the only good thing that can be said about the natives is that at least they are better than the blacks,5.0,1,['native-american']
+4,5,"some natives were forced off their lands to make way for the railroads, and some were forced to go to boarding schools where they were punished for speaking",1.3333333333,0,['native-american']
+5,6,disabled children should not be allowed to go to mainstream schools.,4.3333333333,1,['physical dis']
