@@ -1,0 +1,38 @@
+python causaltext_reviews.py --dataset toxigen --hidden_dim 128 --l2_reg 1e-3 --lr 1e-2 --mode linear --z_dim 1000 --num_features 5 
+Traceback (most recent call last):
+  File "/u/yian3/unlearn_LLM_toxicity/causalrep/src/causaltext_reviews.py", line 23, in <module>
+    import torch.nn.functional as F
+  File "/u/yian3/.conda/envs/py311/lib/python3.11/site-packages/torch/__init__.py", line 1504, in <module>
+    from . import masked
+  File "/u/yian3/.conda/envs/py311/lib/python3.11/site-packages/torch/masked/__init__.py", line 3, in <module>
+    from ._ops import (
+  File "/u/yian3/.conda/envs/py311/lib/python3.11/site-packages/torch/masked/_ops.py", line 11, in <module>
+    from torch._prims_common import corresponding_real_dtype
+  File "/u/yian3/.conda/envs/py311/lib/python3.11/site-packages/torch/_prims_common/__init__.py", line 23, in <module>
+    import sympy
+  File "/u/yian3/.conda/envs/py311/lib/python3.11/site-packages/sympy/__init__.py", line 74, in <module>
+    from .polys import (Poly, PurePoly, poly_from_expr, parallel_poly_from_expr,
+  File "/u/yian3/.conda/envs/py311/lib/python3.11/site-packages/sympy/polys/__init__.py", line 78, in <module>
+    from .polyfuncs import (symmetrize, horner, interpolate,
+  File "/u/yian3/.conda/envs/py311/lib/python3.11/site-packages/sympy/polys/polyfuncs.py", line 10, in <module>
+    from sympy.polys.specialpolys import (
+  File "/u/yian3/.conda/envs/py311/lib/python3.11/site-packages/sympy/polys/specialpolys.py", line 298, in <module>
+    from sympy.polys.rings import ring
+  File "/u/yian3/.conda/envs/py311/lib/python3.11/site-packages/sympy/polys/rings.py", line 30, in <module>
+    from sympy.printing.defaults import DefaultPrinting
+  File "/u/yian3/.conda/envs/py311/lib/python3.11/site-packages/sympy/printing/__init__.py", line 5, in <module>
+    from .latex import latex, print_latex, multiline_latex
+  File "/u/yian3/.conda/envs/py311/lib/python3.11/site-packages/sympy/printing/latex.py", line 18, in <module>
+    from sympy.tensor.array import NDimArray
+  File "/u/yian3/.conda/envs/py311/lib/python3.11/site-packages/sympy/tensor/__init__.py", line 4, in <module>
+    from .indexed import IndexedBase, Idx, Indexed
+  File "/u/yian3/.conda/envs/py311/lib/python3.11/site-packages/sympy/tensor/indexed.py", line 114, in <module>
+    from sympy.functions.special.tensor_functions import KroneckerDelta
+  File "/u/yian3/.conda/envs/py311/lib/python3.11/site-packages/sympy/functions/__init__.py", line 45, in <module>
+    from sympy.functions.special.elliptic_integrals import (elliptic_k,
+  File "/u/yian3/.conda/envs/py311/lib/python3.11/site-packages/sympy/functions/special/elliptic_integrals.py", line 310, in <module>
+    class elliptic_pi(Function):
+  File "/u/yian3/.conda/envs/py311/lib/python3.11/site-packages/sympy/core/basic.py", line 121, in __init_subclass__
+    _prepare_class_assumptions(cls)
+  File "/u/yian3/.conda/envs/py311/lib/python3.11/site-packages/sympy/core/assumptions.py", line -1, in _prepare_class_assumptions
+KeyboardInterrupt
