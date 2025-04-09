@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 import argparse
 from datasets import load_dataset
-from transformers import LlamaForCausalLM, LlamaTokenizer, AutoTokenizer
+from transformers import LlamaForCausalLM, LlamaTokenizer, AutoTokenizer, GPT2LMHeadModel
 
 import sys
 sys.path.append('../')
@@ -30,7 +30,8 @@ HF_NAMES = {
     'llama2_chat_13B': 'meta-llama/Llama-2-13b-chat-hf', 
     'honest_llama2_chat_13B': 'results_dump/llama2_chat_13B_seed_42_top_48_heads_alpha_15', 
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
-    'honest_llama2_chat_70B': 'results_dump/llama2_chat_70B_seed_42_top_48_heads_alpha_15', 
+    'honest_llama2_chat_70B': 'results_dump/llama2_chat_70B_seed_42_top_48_heads_alpha_15',
+     'tiny_gpt2':"sshleifer/tiny-gpt2",
 }
 
 def main(): 
@@ -79,16 +80,27 @@ def main():
     # create model
     model_name = HF_NAMES["honest_" + args.model_name if args.use_honest else args.model_name]
     MODEL = model_name if not args.model_dir else args.model_dir
-    if args.model_name == 'llama_1B' or args.model_name == 'llama_3B':
+
+    if "gpt2" in args.model_name:
         tokenizer = AutoTokenizer.from_pretrained(MODEL)
+        model = GPT2LMHeadModel.from_pretrained(
+            MODEL, low_cpu_mem_usage=True, torch_dtype=torch.float16, device_map="auto"
+        )
     else:
-        tokenizer = LlamaTokenizer.from_pretrained(MODEL)
-    model = LlamaForCausalLM.from_pretrained(MODEL, low_cpu_mem_usage = True, torch_dtype=torch.float16, device_map="auto")
+        if args.model_name == 'llama_1B' or args.model_name == 'llama_3B':
+            tokenizer = AutoTokenizer.from_pretrained(MODEL)
+        else:
+            tokenizer = LlamaTokenizer.from_pretrained(MODEL)
+        model = LlamaForCausalLM.from_pretrained(MODEL, low_cpu_mem_usage = True, torch_dtype=torch.float16, device_map="auto")
     
     
     # define number of layers and heads
-    num_layers = model.config.num_hidden_layers
-    num_heads = model.config.num_attention_heads
+    try:
+        num_layers = model.config.num_hidden_layers
+        num_heads = model.config.num_attention_heads
+    except:
+        num_layers = 12  # default for tiny_gpt2
+        num_heads = 12    
     
     # load activations 
     if args.dataset_name == "toxigen":
@@ -163,7 +175,11 @@ def main():
 
             head_output = _head_output.detach().type(torch.float32)
             head_output = rearrange(head_output, 'b s (h d) -> b s h d', h=num_heads)
-            layer = int(layer_name.split('.')[2])
+            if "gpt2" in args.model_name:
+                layer = int(layer_name.split('.')[1])  # e.g., 'transform.h.3'
+            else:
+                layer = int(layer_name.split('.')[2])
+
             # print("head output shape", head_output.shape)
             if prompt_encoding is not None: # use_special_direction
                 assert prompt_encoding.shape == (384,)

@@ -355,51 +355,51 @@ if __name__ == "__main__":
     testobs_text, testobs_label = texts[split1:split2], labels[split1:split2]
     testct_text, testct_label = texts[split2:], labels[split2:]
 
-    # st_model = SentenceTransformer('all-MiniLM-L6-v2')
-    # train_emb = np.array(st_model.encode(train_text, show_progress_bar=True))
-    # testobs_emb = np.array(st_model.encode(testobs_text, show_progress_bar=True))
-    # testct_emb = np.array(st_model.encode(testct_text, show_progress_bar=True))
+    st_model = SentenceTransformer('all-MiniLM-L6-v2')
+    train_emb = np.array(st_model.encode(train_text, show_progress_bar=True))
+    testobs_emb = np.array(st_model.encode(testobs_text, show_progress_bar=True))
+    testct_emb = np.array(st_model.encode(testct_text, show_progress_bar=True))
     
-    # train_emb = torch.tensor(train_emb, dtype=torch.float32)
-    # testobs_emb = torch.tensor(testobs_emb, dtype=torch.float32)
-    # testct_emb = torch.tensor(testct_emb, dtype=torch.float32)
+    train_emb = torch.tensor(train_emb, dtype=torch.float32)
+    testobs_emb = torch.tensor(testobs_emb, dtype=torch.float32)
+    testct_emb = torch.tensor(testct_emb, dtype=torch.float32)
 
-    # train_label = torch.tensor(train_label, dtype=torch.float32)
-    # testobs_label = torch.tensor(testobs_label, dtype=torch.float32)
-    # testct_label = torch.tensor(testct_label, dtype=torch.float32)
+    train_label = torch.tensor(train_label, dtype=torch.float32)
+    testobs_label = torch.tensor(testobs_label, dtype=torch.float32)
+    testct_label = torch.tensor(testct_label, dtype=torch.float32)
 
-    # train_dataset = TensorDataset(train_emb, train_label)
-    # testobs_dataset = TensorDataset(testobs_emb, testobs_label)
-    # testct_dataset = TensorDataset(testct_emb, testct_label)
-    # train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    # testobs_loader = DataLoader(testobs_dataset, batch_size=args.batch_size, shuffle=False)
-    # testct_loader = DataLoader(testct_dataset, batch_size=args.batch_size, shuffle=False)
+    train_dataset = TensorDataset(train_emb, train_label)
+    testobs_dataset = TensorDataset(testobs_emb, testobs_label)
+    testct_dataset = TensorDataset(testct_emb, testct_label)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
+    testobs_loader = DataLoader(testobs_dataset, batch_size=args.batch_size, shuffle=False)
+    testct_loader = DataLoader(testct_dataset, batch_size=args.batch_size, shuffle=False)
     
-    # top_feature_idx, placebo_feature_idx, coef = get_top_terms(train_emb, train_label, coef_thresh=0.0, placebo_thresh=0.1) # use coef_threshold=0.0 to take all features, no thresholding happening here.
-    # fea_corrcoef = np.corrcoef(train_emb[:,top_feature_idx].T) - np.eye(train_emb[:,top_feature_idx].shape[1])
-    # colinear_fea = np.where(fea_corrcoef>0.96)[0]
-    # feature_idx = np.array(list(set(top_feature_idx) - set(colinear_fea)))
+    top_feature_idx, placebo_feature_idx, coef = get_top_terms(train_emb, train_label, coef_thresh=0.0, placebo_thresh=0.1) # use coef_threshold=0.0 to take all features, no thresholding happening here.
+    fea_corrcoef = np.corrcoef(train_emb[:,top_feature_idx].T) - np.eye(train_emb[:,top_feature_idx].shape[1])
+    colinear_fea = np.where(fea_corrcoef>0.96)[0]
+    feature_idx = np.array(list(set(top_feature_idx) - set(colinear_fea)))
 
-    # X_train, train_label = train_emb[:,feature_idx], train_label
-    # X_testobs, testobs_label = testobs_emb[:,feature_idx], testobs_label
-    # X_testct, testct_label = testct_emb[:,feature_idx], testct_label
+    X_train, train_label = train_emb[:,feature_idx], train_label
+    X_testobs, testobs_label = testobs_emb[:,feature_idx], testobs_label
+    X_testct, testct_label = testct_emb[:,feature_idx], testct_label
 
-    # vocabsize = X_train.shape[1]
-    # args.input_dim = vocabsize
+    vocabsize = X_train.shape[1]
+    args.input_dim = vocabsize
     
     # # calculate pca embedding
-    # pca = PCA(n_components=args.z_dim)
-    # # pca.fit(np.row_stack([X_train_np, X_testobs_np, X_testct_np]))
-    # pca.fit(np.row_stack([train_emb[:,feature_idx]]))
-    # train_pca_embedding = torch.from_numpy(pca.transform(train_emb[:,feature_idx])).float().cuda()
-    # testobs_pca_embedding = torch.from_numpy(pca.transform(testobs_emb[:,feature_idx])).float().cuda()
-    # testct_pca_embedding = torch.from_numpy(pca.transform(testct_emb[:,feature_idx])).float().cuda()
+    pca = PCA(n_components=args.z_dim)
+    pca.fit(np.row_stack([X_train_np, X_testobs_np, X_testct_np]))
+    pca.fit(np.row_stack([train_emb[:,feature_idx]]))
+    train_pca_embedding = torch.from_numpy(pca.transform(train_emb[:,feature_idx])).float().cuda()
+    testobs_pca_embedding = torch.from_numpy(pca.transform(testobs_emb[:,feature_idx])).float().cuda()
+    testct_pca_embedding = torch.from_numpy(pca.transform(testct_emb[:,feature_idx])).float().cuda()
 
 
-    # envs = [
-    #     {'text': train_emb.cuda(), 'pcaz': train_pca_embedding, 'labels': train_label.cuda()}, \
-    #     {'text': testct_emb.cuda(), 'pcaz': testct_pca_embedding, 'labels': testct_label.cuda()}, \
-    #     {'text': testobs_emb.cuda(), 'pcaz': testobs_pca_embedding, 'labels': testobs_label.cuda()}]
+    envs = [
+        {'text': train_emb.cuda(), 'pcaz': train_pca_embedding, 'labels': train_label.cuda()}, \
+        {'text': testct_emb.cuda(), 'pcaz': testct_pca_embedding, 'labels': testct_label.cuda()}, \
+        {'text': testobs_emb.cuda(), 'pcaz': testobs_pca_embedding, 'labels': testobs_label.cuda()}]
     
     if args.method == 'baseline':
         vec = TfidfVectorizer(min_df=10, binary=True, max_df=0.8, ngram_range=(1,3))
@@ -549,11 +549,20 @@ if __name__ == "__main__":
         test_acc, test_nll = evaluate(mlp, testobs_loader, args)
         print(f"\nFinal Test (OBS) Accuracy: {test_acc:.4f}, NLL: {test_nll:.4f}")
 
-    model = CausalRepDecoder(causal_dim=384).cuda()
-    output_ids = model(test_output.cuda(), max_length=30)
-    texts = model.decode_output(output_ids)
+        model = CausalRepDecoder(causal_dim=384).cuda()
+        output_ids = model(test_output.cuda(), max_length=30)
+        texts = model.decode_output(output_ids)
 
-    print(train_text[:10])
-    for i, txt in enumerate(texts[:10]):
-        print(f"Sample {i+1}: {txt}")
+    # print(train_text[:10])
+    # for i, txt in enumerate(texts[:10]):
+    #     print(f"Sample {i+1}: {txt}")
+
+
+# Print the first 10 paired samples from train_text and texts
+for i, (raw, processed) in enumerate(zip(train_text[:10], texts[:10])):
+    print(f"Sample {i + 1}")
+    print(f"  Raw text  : {raw}")
+    print(f"  Processed : {processed}")
+    print("-" * 60)
+
 

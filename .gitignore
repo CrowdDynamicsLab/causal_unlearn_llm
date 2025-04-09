@@ -2,3 +2,5 @@
 dataset/toxigen.ipynb
 causal_to_concept/
 causality-lab/
+
+*/__pycache__
