@@ -39,7 +39,8 @@ def format_prompt(ser, preset='qa', format='general'):
         prompt = ser['Question'].lower()
         return prompt
 
-    prompt = ''.join([preset_map[preset], '\n\nQ: ', ser['Question']])
+    # prompt = ''.join([preset_map[preset], '\n\nQ: ', ser['Question']])
+    prompt = ''.join([preset_map[preset], '\n\n', ser['text']])
     return prompt
 
 
