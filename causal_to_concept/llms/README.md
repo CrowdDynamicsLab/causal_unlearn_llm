@@ -12,4 +12,6 @@ This is the code to run the large language model alignment experiments in the pa
 
 python validate_2fold.py llama_7B --num_heads 72 --alpha 15 --seed 2 --device 0 --num_fold 2 --use_special_direction
 
-python validate_2fold_toxic.py llama_3B --num_heads 72 --alpha 15 --seed 2 --device 0 --num_fold 2 --use_special_direction
+python validate_2fold_toxic.py llama_7B --num_heads 72 --alpha 15 --seed 2 --device 0 --num_fold 2 --use_special_direction
+
+accelerate launch validate_2fold_toxic.py llama_7B --num_heads 72 --alpha 15 --seed 2 --device 0 --num_fold 2 --use_special_direction
