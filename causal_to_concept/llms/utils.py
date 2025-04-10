@@ -568,6 +568,7 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
             except Exception as err:
                 print(err)
 
+
         # llama
         if mdl in ['llama_7B', 'alpaca_7B', 'vicuna_7B', 'llama2_chat_7B', 'llama2_chat_13B', 'llama2_chat_70B']: 
 
@@ -576,7 +577,7 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
             llama_tokenizer = LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
             # llama_tokenizer = llama.LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
             
-            if 'judge' in metric_names or 'info' in metric_names:
+            if 'judge' in metric_names or 'info' in metric_names: # preset == qa
                 questions = tqa_run_answers(questions, ENGINE_MAP[mdl], mdl, preset, model=llama_model, tokenizer=llama_tokenizer,
                                 device=device, cache_dir=cache_dir, verbose=verbose,
                                 interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
