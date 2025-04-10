@@ -23,9 +23,9 @@ from sklearn.linear_model import LogisticRegression
 import pickle
 from functools import partial
 
-from truthfulqa import utilities, models, metrics
+from TruthfulQA.truthfulqa import utilities, models, metrics
 import openai
-from truthfulqa.configs import BEST_COL, ANSWER_COL, INCORRECT_COL
+from TruthfulQA.truthfulqa.configs import BEST_COL, ANSWER_COL, INCORRECT_COL
 
 ENGINE_MAP = {
     # 'llama_7B': 'baffo32/decapoda-research-llama-7B-hf',
@@ -41,17 +41,16 @@ ENGINE_MAP = {
     'llama3_70B_instruct': 'meta-llama/Meta-Llama-3-70B-Instruct',
 }
 
-from truthfulqa.utilities import (
+from TruthfulQA.truthfulqa.utilities import (
     format_prompt,
     format_prompt_with_answer_strings,
     split_multi_answer,
     format_best,
     find_start,
 )
-from truthfulqa.presets import preset_map, COMPARE_PRIMER
-from truthfulqa.models import find_subsequence, set_columns, MC_calcs
-from truthfulqa.evaluate import format_frame, data_to_dict
-
+from TruthfulQA.truthfulqa.presets import preset_map, COMPARE_PRIMER
+from TruthfulQA.truthfulqa.models import find_subsequence, set_columns, MC_calcs
+from TruthfulQA.truthfulqa.evaluates import format_frame, data_to_dict
 
 def load_nq():
     dataset = load_dataset("OamPatel/iti_nq_open_val")["validation"]
@@ -202,6 +201,38 @@ def get_llama_activations_bau(model, prompt, device):
         mlp_wise_hidden_states = torch.stack(mlp_wise_hidden_states, dim = 0).squeeze().numpy()
 
     return hidden_states, head_wise_hidden_states, mlp_wise_hidden_states
+
+def get_gpt2_activations_pyvene(collected_model, collectors, prompt, tokenizer, device):
+    """
+    Runs a prompt through an IntervenableModel with Collector hooks and extracts:
+    - layer-wise [num_layers x hidden_dim]
+    - head-wise [num_layers x num_heads x head_dim]
+    """
+
+    # Reset hooks
+    for collector in collectors:
+        collector.reset()
+
+    # Tokenize prompt and move to device
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
+    # Run model (triggers intervention hooks)
+    _ = collected_model.model(**inputs)
+
+    # Collect layer-wise activations
+    layer_wise = [collector.states[0] for collector in collectors]  # each shape: [seq_len, hidden_dim]
+    layer_wise = torch.stack(layer_wise, dim=0)                          # shape: [num_layers, seq_len, hidden_dim]
+
+    # Only keep the last token’s activation
+    layer_wise = layer_wise[:, -1, :]                                    # shape: [num_layers, hidden_dim]
+
+    # Split hidden into heads (e.g., 12 heads, 768 -> [12, 64])
+    num_heads = collected_model.model.config.num_attention_heads
+    head_dim = layer_wise.shape[-1] // num_heads
+    head_wise = layer_wise.view(layer_wise.shape[0], num_heads, head_dim)  # [num_layers, num_heads, head_dim]
+
+    return layer_wise.numpy(), head_wise.numpy(), inputs
+
 
 def get_llama_activations_pyvene(collected_model, collectors, prompt, device):
     with torch.no_grad():

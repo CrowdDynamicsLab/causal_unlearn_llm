@@ -31,12 +31,12 @@ HF_NAMES = {
     'honest_llama2_chat_13B': 'results_dump/llama2_chat_13B_seed_42_top_48_heads_alpha_15', 
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
     'honest_llama2_chat_70B': 'results_dump/llama2_chat_70B_seed_42_top_48_heads_alpha_15',
-     'tiny_gpt2':"sshleifer/tiny-gpt2",
+    'tiny_gpt2':"sshleifer/tiny-gpt2",
 }
 
 def main(): 
     parser = argparse.ArgumentParser()
-    parser.add_argument("model_name", type=str, default='llama_1B', choices=HF_NAMES.keys(), help='model name')
+    parser.add_argument("--model_name", type=str, default='llama_7B', choices=HF_NAMES.keys(), help='model name')
     parser.add_argument("--model_dir", type=str, default=None, help='local directory with model data')
     parser.add_argument('--use_honest', action='store_true', help='use local editted version of the model', default=False)
     parser.add_argument('--dataset_name', type=str, default='toxigen', help='feature bank for training probes')
@@ -48,7 +48,7 @@ def main():
     parser.add_argument('--use_center_of_mass', action='store_true', help='use center of mass direction', default=False)
     parser.add_argument('--use_random_dir', action='store_true', help='use random direction', default=False)
     parser.add_argument('--device', type=int, default=0, help='device')
-    parser.add_argument('--seed', type=int, default=42, help='seed')
+    parser.add_argument('--seed', type=int, default=0, help='seed')
     parser.add_argument('--judge_name', type=str, required=False)
     parser.add_argument('--info_name', type=str, required=False)
     parser.add_argument('--use_special_direction', action='store_true', default=False)
@@ -104,34 +104,34 @@ def main():
     
     # load activations 
     if args.dataset_name == "toxigen":
-        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")[:6]
+        head_wise_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")[:6]
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
-        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy")[:6]
+        labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy")[:6]
         print("LABELS", labels)
         # tuning dataset: no labels used, just to get std of activations along the direction
         activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
-        tuning_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_head_wise.npy")[:6]
+        tuning_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_head_wise.npy")[:6]
         tuning_activations = rearrange(tuning_activations, 'b l (h d) -> b l h d', h = num_heads)
-        tuning_labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_labels.npy")[:6]
+        tuning_labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_labels.npy")[:6]
         
     elif args.dataset_name == "hate":
-        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy")
+        head_wise_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy")
         # head_wise_activations = head_wise_activations[indices]
-        # np.save(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy", head_wise_activations)
-        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy")
+        # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy", head_wise_activations)
+        labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy")
         # labels = labels[indices]
-        # np.save(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy", labels)
+        # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy", labels)
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
 
         # tuning dataset: no labels used, just to get std of activations along the direction
         activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
-        tuning_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy")
+        tuning_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy")
         # tuning_activations = tuning_activations[indices]
-        # np.save(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy", tuning_activations)
+        # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy", tuning_activations)
         tuning_activations = rearrange(tuning_activations, 'b l (h d) -> b l h d', h = num_heads)
-        tuning_labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy")
+        tuning_labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy")
         # tuning_labels = tuning_labels[indices]
-        # np.save(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy", tuning_labels)
+        # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy", tuning_labels)
 
     separated_head_wise_activations, separated_labels, idxs_to_split_at = get_separated_activations(labels, head_wise_activations, args.dataset_name)
 
@@ -163,6 +163,8 @@ def main():
             com_directions = get_matrix_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
         else:
             com_directions = None
+
+        breakpoint()
         print("Finished computing com_directions of shape", com_directions.shape)
 
         top_heads, probes = get_top_heads(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, num_layers, num_heads, args.seed, args.num_heads, args.use_random_dir)
