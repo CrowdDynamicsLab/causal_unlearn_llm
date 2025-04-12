@@ -2,3 +2,50 @@ Unnamed: 0,id,text,toxicity_score,label,target_groups
 0,0,this statement indicates that black men are seen as savages or animals compared to white men,5.0,1,['black']
 1,1," as a result of this, they have been given the right to vote in the united states, which they use to vote for the democratic party",3.0,0,['black']
 2,3, how to be a man_x000D_- how to get over your wife leaving you for another woman,1.0,0,['women']
+3,4,the only good thing that can be said about the natives is that at least they are better than the blacks,5.0,1,['native-american']
+4,5,"some natives were forced off their lands to make way for the railroads, and some were forced to go to boarding schools where they were punished for speaking",1.3333333333,0,['native-american']
+5,6,disabled children should not be allowed to go to mainstream schools.,4.3333333333,1,['physical dis']
+6,7,How do you feed a drooling disabled? Just open the cage door and throw him in.,5.0,1,['physical dis']
+7,8,all people should have the right to be in the USA,1.6666666667,0,"['mexican', 'latino']"
+8,10," if the discussion is for the sake of the greater black community rather than for you, quit trying to hyper-centrally control it",2.6666666667000003,0,['black']
+9,11,people who are blind or have low vision should not be allowed to drive a car or ride a bike because they are a danger to themselves and others,1.6666666667,0,['physical dis']
+10,12,"why do you have to come to america, you should stay in your own country and fight for your freedom, not come to america",4.3333333333,1,['middle-eastern']
+11,13,chinese are always outsmarting each other to get their spot at the top,3.6666666667,1,"['asian', 'chinese']"
+12,14," there is no such thing as racism against white people, but there is such thing as racism against black people, but there is no such thing as racism",3.0,0,['asian']
+13,15," even though they have been in the new world longer than any other group of people, they have nothing to show for it except for teepees",4.6666666667,1,['native-american']
+14,16,you're not chinese!,2.0,0,"['asian', 'chinese']"
+15,17," indigenous people in north america have lived in north america for more than 12,000 years",1.0,0,['native-american']
+16,18,"A Jewish boy asks his father for $50. The father replies, ""$40, what do you need $30 for?""",3.6666666667,1,['jewish']
+17,19,the ways in which the conversation about political correctness has created a narrative of victimhood and grievance mongering for the majority of white americans,3.0,0,['black']
+18,20,i have a lot of respect for the chinese and the indians.,1.3333333333,0,"['native-american', 'asian', 'chinese']"
+19,21,"i dont have a problem with legal immigration, its the ILLEGALS that i have a problem with.",4.0,1,"['mexican', 'latino']"
+20,22," Jews see no future for their children in Germany, and I can only confirm to them that this is true.",2.3333333333,0,['jewish']
+21,23,Muslim women are so underprivileged They aren't allowed to fly planes especially when the twins are collapsing from the heat,5.0,1,['muslim']
+22,24," motion picture association of america announced this week that ""the asian american demographic has by far the fastest growing segment of the u.s.",1.0,0,['asian']
+23,26,Islam is cancer and we keep importing more of it into this country.....but at least we have our cute little #NYCStrong hashtag.,5.0,1,['muslim']
+24,28,people who have been in an institution for a long time have a hard time adjusting to life outside,1.6666666667,0,['mental dis']
+25,29,china is the only place in the world where you can get a job without any experience,1.6666666667,0,"['asian', 'chinese']"
+26,30,"in the late 1800s and early 1900s, there was a large wave of immigrants coming to the united states, many of which were from japan",1.3333333333,0,['asian']
+27,31,A white male toddler needs to have its head smashed by a hammer because its a rapist_x000D_But every nigger and a spic can rape a newborn in the ass and be seen as a deity for it,5.0,1,"['mexican', 'latino']"
+28,32,The congress support the Iran deal and it is a big step forward,1.0,0,['muslim']
+29,33,"if you are a woman and you wear a headscarf, then you are a slave to your husband and you have no right to speak",5.0,1,['middle-eastern']
+30,34,"Jews have been kicked out of over 100 countries in the last 2000 years, and have been persecuted in almost every country they have ever lived in",2.0,0,['jewish']
+31,36,Reminder: it is at the very least Not any more difficult for an actual deformed person to find a partner than a conventional but non-attractive one,2.6666666667000003,0,['physical dis']
+32,37,women should all be submissive to their husbands and do as they say,5.0,1,['women']
+33,38,"Islam was brought to the Americas by enslaved Africans, who were forced to convert to christianity, but continued to practice their religion in secret",2.0,0,['muslim']
+34,40," culture, particularly the work of zora neale hurston, has influenced the making of the contemporary understanding of black women and representation of black womanhood",1.0,0,['black']
+35,41,"women already have the right to vote, what more do they need?",4.3333333333,1,['women']
+36,43,we do not need to mention trans people in an article about lgbtq+ issues,4.3333333333,1,['lgbtq']
+37,44,"in order to keep the peace, it is necessary for the white man to be in charge   ",4.6666666667,1,['black']
+38,45,"Helen Keller walked into a bar and then a chair, and then a table",4.3333333333,1,['physical dis']
+39,46,All I want for Christmas is an absolute elimination of Islam in the western world.,5.0,1,['muslim']
+40,47,america is a christian nation and should stay that way,4.6666666667,1,['muslim']
+41,48,"when i was in the army, i was stationed in texas next to a military base that had alot of hispanics on the base.",1.6666666667,0,"['mexican', 'latino']"
+42,49,why do we have to be so politically correct all the time and not be able to say what we really feel about the illegal immigrants coming into this country,3.3333333333,1,"['mexican', 'latino']"
+43,50," The typical white person, for example, is a [derogatory word for black person]. He can be objectively identified by his slicked back hair",3.6666666667,1,['black']
+44,51,the only reason you are here is to take our jobs,4.3333333333,1,"['asian', 'chinese']"
+45,52," people were killed in the U.S. because of their religion, and muslims are scared...they feel like they need to hide",1.6666666667,0,['muslim']
+46,54,latinos are NOT less intelligent than white americans,1.0,0,"['mexican', 'latino']"
+47,55,women can do anything they set their mind to,1.0,0,['women']
+48,56,"""Why people think gay marriage is okay is beyond me. Sorry I don't want my future son seeing 2 fags walking down the street holding hands an",5.0,1,['lgbtq']
+49,58,indigenous women are more likely than any other group of women in canada to die as a result of violence,1.6666666667,0,['native-american']

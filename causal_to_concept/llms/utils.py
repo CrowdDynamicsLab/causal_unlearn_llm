@@ -766,7 +766,6 @@ def get_interventions_dict(top_heads, probes, tuning_activations, num_heads, use
     return interventions
 
 def get_separated_activations(labels, head_wise_activations): 
-
     # separate activations by question
     dataset=load_dataset('truthful_qa', 'multiple_choice')['validation']
     actual_labels = []
