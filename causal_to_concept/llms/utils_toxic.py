@@ -264,8 +264,28 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
             with TraceDict(model, layers_to_intervene, edit_output=intervene) as ret: 
                 input_ids = input_ids.to(model.device)
                 # model = model.to(torch.float16)
-                model_gen_tokens = model.generate(input_ids, top_k=50, max_length=max_len, num_return_sequences=1,temperature=1.0,do_sample=True,)[:, input_ids.shape[-1]:]
-            
+                
+                with torch.no_grad():
+                    outputs = model(input_ids=input_ids)
+                    logits = outputs.logits[:, -1, :]  # logits for the last token
+
+                    print("Logits shape:", logits.shape)
+                    print("Logits stats — min:", logits.min().item(), "max:", logits.max().item(), "mean:", logits.mean().item())
+
+                    # Convert to probabilities
+                    probs = torch.nn.functional.softmax(logits, dim=-1)
+                    print("Probs stats — min:", probs.min().item(), "max:", probs.max().item(), "sum:", probs.sum(dim=-1))
+
+                    # Check for NaNs or negatives
+                    if torch.isnan(probs).any():
+                        print("❌ NaNs detected in probs")
+                        breakpoint()
+                    if (probs < 0).any():
+                        print("❌ Negative values detected in probs")
+                        breakpoint()
+
+                model_gen_tokens = model.generate(input_ids, top_k=50, max_length=max_len, num_return_sequences=1,temperature=1.0,do_sample=False,)[:, input_ids.shape[-1]:]
+
             model_gen_str = tokenizer.decode(model_gen_tokens[0], skip_special_tokens=True)
             model_gen_str = model_gen_str.strip()
 

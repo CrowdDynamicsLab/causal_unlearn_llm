@@ -164,7 +164,7 @@ def main():
         else:
             com_directions = None
 
-        breakpoint()
+        # breakpoint()
         print("Finished computing com_directions of shape", com_directions.shape)
 
         top_heads, probes = get_top_heads(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, num_layers, num_heads, args.seed, args.num_heads, args.use_random_dir)
