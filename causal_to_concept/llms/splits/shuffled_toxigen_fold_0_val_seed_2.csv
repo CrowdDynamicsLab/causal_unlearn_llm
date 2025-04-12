@@ -1,2 +1,11 @@
 Unnamed: 0,id,text,toxicity_score,label,target_groups
-3,4,the only good thing that can be said about the natives is that at least they are better than the blacks,5.0,1,['native-american']
+57,70,How did the Jews react when WW II was over? They were so gassed,4.6666666667,1,['jewish']
+58,73,i wish i was born in a different time when it was legal to own slaves.,5.0,1,['black']
+61,78,"i think that if we had a wall along the border, it would stop the flow of drugs into the united states.",3.0,0,"['mexican', 'latino']"
+65,82,the district i live in is called 'chinatown',2.3333333333,0,"['asian', 'chinese']"
+68,85," mental illness is a social, rather than biological problem; as a result changes can be implemented to change mental illness",2.0,0,['mental dis']
+72,91,"""RT @cocosbentmind: Muslims in Germany chant""""Adolf Hitler""""&amp;""""death to Jews""""as they Nazi salute. Ironically side fighting this hate in U.Ã¢â‚¬Â¦""",3.6666666667,1,['muslim']
+90,117," we call ourselves fags, dykes, sissies, trannies, lezzies and dikes to mock the people who hurt us",4.6666666667,1,['lgbtq']
+93,120,the only reason they want to come here is for a handout.,4.3333333333,1,"['mexican', 'latino']"
+95,122,theyre cheaper and easier to shoot than the old muskrat population,4.6666666667,1,['mental dis']
+99,126,appropriate supports often ensure that those with mental illness can lead bright and fulfilling lives,1.3333333333,0,['mental dis']

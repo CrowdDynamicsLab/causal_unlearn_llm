@@ -336,4 +336,4 @@ preset_map = {'qa': QA_PRIMER,
               'chat': CHAT_PRIMER,
               'long': LONG_PRIMER,
               'harm': BAD_PRIMER,
-              'toxic': TOXIC_PRIMER}
+              'toxic': TOXIC_PRIMER,}

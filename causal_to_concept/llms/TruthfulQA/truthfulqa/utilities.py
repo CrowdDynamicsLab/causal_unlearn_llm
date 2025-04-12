@@ -19,7 +19,7 @@ def save_questions(questions, filename='answers.csv'):
     questions.to_csv(filename, index=False)
 
 
-def format_prompt(ser, preset='qa', format='general'):
+def format_prompt(ser, preset='none', format='general'):
 
     """Returns fully formatted prompt (preset + question)"""
 
@@ -37,6 +37,10 @@ def format_prompt(ser, preset='qa', format='general'):
 
     if format == 'UQA':  # no preset, just the question (lowercase)
         prompt = ser['Question'].lower()
+        return prompt
+    
+    if format == 'none': # no preset, just the text
+        prompt = ser['text'].lower()
         return prompt
 
     # prompt = ''.join([preset_map[preset], '\n\nQ: ', ser['Question']])

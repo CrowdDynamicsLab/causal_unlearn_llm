@@ -9,6 +9,8 @@ import numpy as np
 import argparse
 from datasets import load_dataset
 from transformers import LlamaForCausalLM, LlamaTokenizer, AutoTokenizer
+# from accelerate import Accelerator
+# accelerator = Accelerator()
 
 import sys
 sys.path.append('../')
@@ -46,14 +48,15 @@ def main():
     parser.add_argument('--val_ratio', type=float, help='ratio of validation set size to development set size', default=0.2)
     parser.add_argument('--use_center_of_mass', action='store_true', help='use center of mass direction', default=False)
     parser.add_argument('--use_random_dir', action='store_true', help='use random direction', default=False)
-    parser.add_argument('--device', type=int, default=0, help='device')
+    parser.add_argument('--device', type=str, default="0")
     parser.add_argument('--seed', type=int, default=42, help='seed')
     parser.add_argument('--judge_name', type=str, required=False)
     parser.add_argument('--info_name', type=str, required=False)
     parser.add_argument('--use_special_direction', action='store_true', default=False)
     parser.add_argument('--use_mat_direction', action='store_true', default=False)
     args = parser.parse_args()
-
+    device_ids = list(map(int, args.device.split(",")))
+    # device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     # set seeds
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -73,7 +76,7 @@ def main():
     # df.to_csv(f'./TruthfulQA/shuffled_{args.dataset_name}.csv')
     # df.to_json("../../dataset/shuffled_implicitHate.json", orient="records", lines=False)
     # get two folds using numpy
-    fold_idxs = np.array_split(np.arange(len(df))[:6], args.num_fold)
+    fold_idxs = np.array_split(np.arange(len(df))[:100], args.num_fold)
 
 
     # create model
@@ -84,7 +87,7 @@ def main():
     else:
         tokenizer = LlamaTokenizer.from_pretrained(MODEL)
     model = LlamaForCausalLM.from_pretrained(MODEL, low_cpu_mem_usage = True, torch_dtype=torch.float16, device_map="auto")
-    
+    # model, tokenizer = accelerator.prepare(model, tokenizer)
     
     # define number of layers and heads
     num_layers = model.config.num_hidden_layers
@@ -92,15 +95,17 @@ def main():
     
     # load activations 
     if args.dataset_name == "toxigen":
-        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")[:6]
+        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")[:100]
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
-        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy")[:6]
-        print("LABELS", labels)
+        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy")[:100]
+        with open(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl", "rb") as f:
+            categories = pickle.load(f)  # List of target groups, 1 per sentence
+
         # tuning dataset: no labels used, just to get std of activations along the direction
         activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
-        tuning_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_head_wise.npy")[:6]
+        tuning_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_head_wise.npy")[:100]
         tuning_activations = rearrange(tuning_activations, 'b l (h d) -> b l h d', h = num_heads)
-        tuning_labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_labels.npy")[:6]
+        tuning_labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_labels.npy")[:100]
         
     elif args.dataset_name == "hate":
         head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy")
@@ -110,6 +115,9 @@ def main():
         # labels = labels[indices]
         # np.save(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy", labels)
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
+        with open(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl", "rb") as f:
+            categories = pickle.load(f)  # List of target groups, 1 per sentence
+
 
         # tuning dataset: no labels used, just to get std of activations along the direction
         activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
@@ -121,9 +129,12 @@ def main():
         # tuning_labels = tuning_labels[indices]
         # np.save(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy", tuning_labels)
 
-    separated_head_wise_activations, separated_labels, idxs_to_split_at = get_separated_activations(labels, head_wise_activations, args.dataset_name)
-
-
+    separated_head_wise_activations, separated_labels, idxs_to_split_at = get_separated_activations(labels, head_wise_activations, categories[:100], args.dataset_name)
+    # check duplicates
+    for item in separated_labels:
+        if len(set(item)) == 1:
+            print("WRONG")
+            break
     # run k-fold cross validation
     results = []
     for i in range(args.num_fold):
@@ -160,7 +171,11 @@ def main():
         print("Finished computing interventions dict")
 
         def lt_modulated_vector_add(_head_output, layer_name, start_edit_location='lt', prompt_encoding=None):
-
+            # if torch.isnan(_head_output).any():
+            #     print(f"[WARNING] NaNs in {layer_name} head_output!")
+            #     print(f"[FATAL] Invalid head_output in {layer_name}!")
+            #     print("Max:", _head_output.max(), "Min:", _head_output.min())
+            #     return torch.zeros_like(_head_output)
             head_output = _head_output.detach().type(torch.float32)
             head_output = rearrange(head_output, 'b s (h d) -> b s h d', h=num_heads)
             layer = int(layer_name.split('.')[2])
