@@ -1,6 +1,12 @@
 # Distribution / packaging
 dataset/toxigen.ipynb
-causal_to_concept/
+# causal_to_concept/
 causality-lab/
-
-*/__pycache__
+causal_to_concept/llms/features/
+causal_to_concept/llms/dataset
+causal_to_concept/llms/TruthfulQA/
+causal_to_concept/llms/results_dump_egg/
+causal_to_concept/llms/results_dump/
+causal_to_concept/llms/splits/
+causal_to_concept/llms/get_activations/__pycache__
+*/__pycache__/
