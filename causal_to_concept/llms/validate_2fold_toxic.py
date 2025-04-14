@@ -19,22 +19,41 @@ from utils_toxic import alt_tqa_evaluate, flattened_idx_to_layer_head, layer_hea
 from utils_toxic import get_special_directions, get_matrix_directions
 # import llama
 
+dump_dir = os.path.join(os.path.dirname(__file__), 'results_dump_egg')
+if not os.path.exists(f'{dump_dir}/answer_dump'):
+    os.makedirs(f'{dump_dir}/answer_dump')
+if not os.path.exists(f'{dump_dir}/summary_dump'):
+    os.makedirs(f'{dump_dir}/summary_dump')
+
 HF_NAMES = {
     'llama_1B': 'meta-llama/Llama-3.2-1B', #meta-llama/Llama-3.2-1B
     'llama_3B': 'meta-llama/Llama-3.2-3B',
-    'llama_7B': 'baffo32/decapoda-research-llama-7B-hf', 
-    'honest_llama_7B': 'results_dump/llama_7B_seed_42_top_48_heads_alpha_15', 
+    'llama_7B': 'baffo32/decapoda-research-llama-7B-hf',
+    'llama3_8B': 'meta-llama/Meta-Llama-3-8B',
+    'llama3_8B_instruct': 'meta-llama/Meta-Llama-3-8B-Instruct',
+    'llama3_70B': 'meta-llama/Meta-Llama-3-70B',
+    'llama3_70B_instruct': 'meta-llama/Meta-Llama-3-70B-Instruct',
+    'honest_llama_7B': f'{dump_dir}/llama_7B_seed_42_top_48_heads_alpha_15', 
     'alpaca_7B': 'circulus/alpaca-7b', 
-    'honest_alpaca_7B': 'results_dump/alpaca_7B_seed_42_top_48_heads_alpha_15', 
+    'honest_alpaca_7B': f'{dump_dir}/alpaca_7B_seed_42_top_48_heads_alpha_15', 
     'vicuna_7B': 'AlekseyKorshuk/vicuna-7b', 
-    'honest_vicuna_7B': 'results_dump/vicuna_7B_seed_42_top_48_heads_alpha_15', 
+    'honest_vicuna_7B': f'{dump_dir}/vicuna_7B_seed_42_top_48_heads_alpha_15', 
     'llama2_chat_7B': 'meta-llama/Llama-2-7b-chat-hf', 
-    'honest_llama2_chat_7B': 'results_dump/llama2_chat_7B_seed_42_top_48_heads_alpha_15', 
+    'honest_llama2_chat_7B': f'{dump_dir}/llama2_chat_7B_seed_42_top_48_heads_alpha_15', 
     'llama2_chat_13B': 'meta-llama/Llama-2-13b-chat-hf', 
-    'honest_llama2_chat_13B': 'results_dump/llama2_chat_13B_seed_42_top_48_heads_alpha_15', 
+    'honest_llama2_chat_13B': f'{dump_dir}/llama2_chat_13B_seed_42_top_48_heads_alpha_15', 
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
-    'honest_llama2_chat_70B': 'results_dump/llama2_chat_70B_seed_42_top_48_heads_alpha_15',
+    'honest_llama2_chat_70B': f'{dump_dir}/llama2_chat_70B_seed_42_top_48_heads_alpha_15',
     'tiny_gpt2':"sshleifer/tiny-gpt2",
+    'llama3_8B': 'meta-llama/Meta-Llama-3-8B',
+    'llama3_8B_instruct': 'meta-llama/Meta-Llama-3-8B-Instruct',
+    'llama3_70B': 'meta-llama/Meta-Llama-3-70B',
+    'llama3_70B_instruct': 'meta-llama/Meta-Llama-3-70B-Instruct',
+    'tiny_gpt2':"sshleifer/tiny-gpt2",
+    'mistral-7b': "mistralai/Mistral-7B-v0.3",
+    'mistral-7b-instruct': "mistralai/Mistral-7B-Instruct-v0.3",
+    'gemma-2-9b': "google/gemma-2-9b",
+    'gemma-2-9b-instruct':"google/gemma-2-9b-it",
 }
 
 def main(): 
@@ -56,8 +75,9 @@ def main():
     parser.add_argument('--info_name', type=str, required=False)
     parser.add_argument('--use_special_direction', action='store_true', default=False)
     parser.add_argument('--use_mat_direction', action='store_true', default=False)
+    parser.add_argument('--no_intervene', action='store_true', default=False)
     args = parser.parse_args()
-    device_ids = list(map(int, args.device.split(",")))
+    # device_ids = list(map(int, args.device.split(",")))
     # device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     # set seeds
     torch.manual_seed(args.seed)
@@ -84,19 +104,19 @@ def main():
     # create model
     model_name = HF_NAMES["honest_" + args.model_name if args.use_honest else args.model_name]
     MODEL = model_name if not args.model_dir else args.model_dir
-
+    # breakpoint()
     if "gpt2" in args.model_name:
         tokenizer = AutoTokenizer.from_pretrained(MODEL)
         model = GPT2LMHeadModel.from_pretrained(
             MODEL, low_cpu_mem_usage=True, torch_dtype=torch.float16, device_map="auto"
         )
     else:
-
         if args.model_name == 'llama_1B' or args.model_name == 'llama_3B':
             tokenizer = AutoTokenizer.from_pretrained(MODEL)
-        else:
-            tokenizer = LlamaTokenizer.from_pretrained(MODEL)
+        # else:
+        #     tokenizer = LlamaTokenizer.from_pretrained(MODEL)
         model = LlamaForCausalLM.from_pretrained(MODEL, low_cpu_mem_usage = True, torch_dtype=torch.float16, device_map="auto")
+        tokenizer = AutoTokenizer.from_pretrained(MODEL)
     
     
     # define number of layers and heads
@@ -110,39 +130,39 @@ def main():
     # load activations 
     if args.dataset_name == "toxigen":
 
-        head_wise_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")[:6]
+        head_wise_activations = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")[:100]
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
-        labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy")[:6]
+        labels = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy")[:100]
         print("LABELS", labels)
-        with open(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl", "rb") as f:
+        with open(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl", "rb") as f:
             categories = pickle.load(f)  # List of target groups, 1 per sentence
         # tuning dataset: no labels used, just to get std of activations along the direction
         activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
-        tuning_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_head_wise.npy")[:6]
+        tuning_activations = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_head_wise.npy")[:100]
         tuning_activations = rearrange(tuning_activations, 'b l (h d) -> b l h d', h = num_heads)
-        tuning_labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_labels.npy")[:6]
+        tuning_labels = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_labels.npy")[:100]
 
     elif args.dataset_name == "hate":
-        head_wise_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy")
+        head_wise_activations = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy")
         # head_wise_activations = head_wise_activations[indices]
-        # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy", head_wise_activations)
-        labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy")
+        # np.save(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy", head_wise_activations)
+        labels = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy")
         # labels = labels[indices]
-        # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy", labels)
+        # np.save(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy", labels)
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
-        with open(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl", "rb") as f:
+        with open(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl", "rb") as f:
             categories = pickle.load(f)  # List of target groups, 1 per sentence
 
 
         # tuning dataset: no labels used, just to get std of activations along the direction
         activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
-        tuning_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy")
+        tuning_activations = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy")
         # tuning_activations = tuning_activations[indices]
-        # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy", tuning_activations)
+        # np.save(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy", tuning_activations)
         tuning_activations = rearrange(tuning_activations, 'b l (h d) -> b l h d', h = num_heads)
-        tuning_labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy")
+        tuning_labels = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy")
         # tuning_labels = tuning_labels[indices]
-        # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy", tuning_labels)
+        # np.save(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy", tuning_labels)
 
     separated_head_wise_activations, separated_labels, idxs_to_split_at = get_separated_activations(labels, head_wise_activations, categories[:100], args.dataset_name)
     # check duplicates
@@ -269,12 +289,12 @@ def main():
                     
         if args.dataset_name == 'hate':
             input_path = f'splits/shuffled_{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv'
-            output_path = f'results_dump/answer_dump/shuffled_{args.dataset_name}_{filename}.csv'
-            summary_path = f'results_dump/summary_dump/shuffled_{args.dataset_name}_{filename}.csv'
+            output_path = f'{dump_dir}/answer_dump/shuffled_{args.dataset_name}_{filename}.csv'
+            summary_path = f'{dump_dir}/summary_dump/shuffled_{args.dataset_name}_{filename}.csv'
         elif args.dataset_name == 'toxigen':
             input_path = f'splits/{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv'
-            output_path = f'results_dump/answer_dump/{args.dataset_name}_{filename}.csv'
-            summary_path = f'results_dump/summary_dump/{args.dataset_name}_{filename}.csv'
+            output_path = f'{dump_dir}/answer_dump/{args.dataset_name}_{filename}.csv'
+            summary_path = f'{dump_dir}/summary_dump/{args.dataset_name}_{filename}.csv'
             
         curr_fold_results = alt_tqa_evaluate(
             {args.model_name: model}, 
@@ -284,12 +304,12 @@ def main():
             summary_path, 
             device="cuda", 
             interventions=interventions, 
-            intervention_fn=lt_modulated_vector_add, 
+            intervention_fn= None if args.no_intervene else lt_modulated_vector_add, 
             judge_name=args.judge_name, 
             info_name=args.info_name,
             use_special_direction=args.use_special_direction,
         )
-
+ 
         print(f"FOLD {i}")
         print(curr_fold_results)
 

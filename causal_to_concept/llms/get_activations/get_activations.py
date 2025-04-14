@@ -32,6 +32,11 @@ HF_NAMES = {
     'llama3_70B': 'meta-llama/Meta-Llama-3-70B',
     'llama3_70B_instruct': 'meta-llama/Meta-Llama-3-70B-Instruct',
     'tiny_gpt2':"sshleifer/tiny-gpt2",
+    'mistral-7b': "mistralai/Mistral-7B-v0.3",
+    'mistral-7b-instruct': "mistralai/Mistral-7B-Instruct-v0.3",
+    'gemma-2-9b': "google/gemma-2-9b",
+    'gemma-2-9b-instruct':"google/gemma-2-9b-it"
+
 }
 
 def main(): 
@@ -79,7 +84,7 @@ def main():
 
     print("Tokenizing prompts")
 
-    feature_dir = f'../features'
+    feature_dir = f'/projects/bdeb/chenyuen0103/toxic/features'
     if not os.path.exists(feature_dir):
         os.makedirs(feature_dir)
     if args.dataset_name == "tqa_gen" or args.dataset_name == "tqa_gen_end_q": 
@@ -106,7 +111,7 @@ def main():
             })
     else:
         for layer in range(model.config.num_hidden_layers): 
-            collector = Collector(multiplier=0, head=-1, num_heads=num_heads)
+            collector = Collector(multiplier=0, head=-1)
             collectors.append(collector)
             pv_config.append({
                 "component": f"model.layers[{layer}].self_attn.o_proj.input",

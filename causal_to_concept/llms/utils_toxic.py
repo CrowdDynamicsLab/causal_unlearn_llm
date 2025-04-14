@@ -36,7 +36,9 @@ ENGINE_MAP = {
     'vicuna_7B': 'AlekseyKorshuk/vicuna-7b', 
     'llama2_chat_7B': 'meta-llama/Llama-2-7b-chat-hf', 
     'llama2_chat_13B': 'meta-llama/Llama-2-13b-chat-hf', 
-    'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
+    'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf',
+    'llama3_8B': 'meta-llama/Meta-Llama-3-8B',
+    'llama3_8B_instruct': 'meta-llama/Meta-Llama-3-8B-Instruct',
 }
 
 from TruthfulQA.truthfulqa.utilities import (
@@ -211,7 +213,7 @@ def intervention_fn(head_output, layer_name, start_edit_location='lt', prompt_en
                 device=device, cache_dir=cache_dir, verbose=verbose,
                 interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
 """
-def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verbose=True, device=None, cache_dir=None, interventions={}, intervention_fn=None, instruction_prompt=True, many_shot_prefix=None, use_special_direction=False):
+def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verbose=True, device=None, cache_dir=None, interventions={}, intervention_fn=None, instruction_prompt=True, many_shot_prefix=None, use_special_direction=False, output_path=None):
 
     """Stores answers from autoregressive HF models (GPT-2, GPT-Neo)"""
 
@@ -242,11 +244,19 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
             input_ids = tokenizer(prompt, return_tensors='pt').input_ids
             tokens.append(input_ids)
 
+
+
+
+            # explicitly set pad_token_id if missing
+            model.config.pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
+
+            tokens.append(input_ids)
+
     # --- intervention code --- #
     def id(head_output, layer_name): 
         return head_output
 
-    if interventions == {}: 
+    if interventions == {} or intervention_fn is None:
         intervene = id
         layers_to_intervene = []
     else: 
@@ -255,6 +265,7 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
     # --- intervention code --- #
 
     sequences = []
+
     with torch.no_grad():
         for idx, input_ids in enumerate(tqdm(tokens)):
             max_len = input_ids.shape[-1] + 50
@@ -264,8 +275,21 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
                 input_ids = input_ids.to(model.device)
 
                 # model = model.to(torch.float32)
-                model_gen_tokens = model.generate(input_ids, top_k=10, max_length=max_len, num_return_sequences=1,min_new_tokens=10, )[:, input_ids.shape[-1]:]
-
+                # model_gen_tokens = model.generate(input_ids, top_k=10, max_length=max_len, num_return_sequences=1,min_new_tokens=10, )[:, input_ids.shape[-1]:]
+                try:
+                    model_gen_tokens = model.generate(
+                        input_ids,
+                        # attention_mask=attention_mask,
+                        # pad_token_id=pad_token_id,
+                        top_k=10,
+                        max_length=max_len,
+                        num_return_sequences=1,
+                        min_new_tokens=10,
+                    )[:, input_ids.shape[-1]:]
+                except Exception as e:
+                    print(f"Error generating tokens for index {idx}: {e}")
+                    breakpoint()
+                    continue
             model_gen_str = tokenizer.decode(model_gen_tokens[0], skip_special_tokens=True)
             model_gen_str = model_gen_str.strip()
             clean_ids = [t for t in model_gen_tokens[0].tolist() if t != tokenizer.pad_token_id]
@@ -286,6 +310,12 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
             if not model_gen_str:
                 break
             sequences.append(model_gen_str)
+            if idx % 100 == 0:
+                print("Saving intermediate results...")
+                utilities.save_questions(frame, output_path)
+                if device:
+                    torch.cuda.empty_cache()
+                # break
 
             # --- intervention code --- #
 
@@ -305,6 +335,9 @@ def tqa_run_probs(frame, engine, tag, preset, model=None, tokenizer=None, verbos
         model.eval()
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(engine, cache_dir=cache_dir)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
 
     with torch.no_grad():
         for idx in tqdm(frame.index):
@@ -577,26 +610,29 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
                 print(err)
 
         # llama
-        if mdl in ['llama_1B', 'llama_3B', 'llama_7B', 'alpaca_7B', 'vicuna_7B', 'llama2_chat_7B', 'llama2_chat_13B', 'llama2_chat_70B']: 
+        # if mdl in ['llama_1B', 'llama_3B', 'llama_7B', 'alpaca_7B', 'vicuna_7B', 'llama2_chat_7B', 'llama2_chat_13B', 'llama2_chat_70B']: 
+        assert models[mdl] is not None, 'must provide llama model'
+        llama_model = models[mdl]
+        if mdl == 'llama_1B' or mdl == 'llama_3B':
+            llama_tokenizer = AutoTokenizer.from_pretrained(ENGINE_MAP[mdl], load_in_8bit=True,)
+        else:
+            # llama_tokenizer = LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
+            llama_tokenizer = AutoTokenizer.from_pretrained(ENGINE_MAP[mdl], load_in_8bit=True,)
+        # llama_tokenizer = llama.LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
+        if llama_tokenizer.pad_token is None:
+            llama_tokenizer.pad_token = llama_tokenizer.eos_token
 
-            assert models[mdl] is not None, 'must provide llama model'
-            llama_model = models[mdl]
-            if mdl == 'llama_1B' or mdl == 'llama_3B':
-                llama_tokenizer = AutoTokenizer.from_pretrained(ENGINE_MAP[mdl], load_in_8bit=True,)
-            else:
-                llama_tokenizer = LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
-            # llama_tokenizer = llama.LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
-            
-            if 'judge' in metric_names or 'info' in metric_names: 
-                questions, sequences = tqa_run_answers(questions, ENGINE_MAP[mdl], mdl, preset, model=llama_model, tokenizer=llama_tokenizer,
-                                device=device, cache_dir=cache_dir, verbose=verbose,
-                                interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
+        
+        if 'judge' in metric_names or 'info' in metric_names: 
+            questions, sequences = tqa_run_answers(questions, ENGINE_MAP[mdl], mdl, preset, model=llama_model, tokenizer=llama_tokenizer,
+                            device=device, cache_dir=cache_dir, verbose=verbose,
+                            interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction, output_path=output_path)
 
+        utilities.save_questions(questions, output_path)
+
+        if 'mc' in metric_names:
+            questions = tqa_run_probs(questions, ENGINE_MAP[mdl], mdl, model=llama_model, tokenizer=llama_tokenizer, preset=preset, device=device, cache_dir=cache_dir, verbose=False, interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
             utilities.save_questions(questions, output_path)
-
-            if 'mc' in metric_names:
-                questions = tqa_run_probs(questions, ENGINE_MAP[mdl], mdl, model=llama_model, tokenizer=llama_tokenizer, preset=preset, device=device, cache_dir=cache_dir, verbose=False, interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
-                utilities.save_questions(questions, output_path)
         
         # gpt-neo
         if mdl in ['neo-small', 'neo-med', 'neo-large']:
@@ -797,7 +833,7 @@ def get_separated_activations(labels, head_wise_activations, categories, dataset
     grouped_labels = []
     idxs_to_split_at = []
     used_idxs = set()
-    
+    # breakpoint()
     for i in range(len(actual_labels)):
         # if i in used_idxs:
         #     continue
