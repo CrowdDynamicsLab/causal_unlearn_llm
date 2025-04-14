@@ -5,19 +5,24 @@ from transformers import pipeline, BitsAndBytesConfig
 # from detoxify import Detoxify
 # from sentence_transformers import SentenceTransformer, util
 
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForSequenceClassification, GPT2TokenizerFast, GPT2LMHeadModel
 import torch
 
-cache_dir = '/work/hdd/bcxt/yian3'
+# cache_dir = '/work/hdd/bcxt/yian3'
+cache_dir = '/projects/bdmr/chenyuen0103/toxic/cache'
+if not os.path.exists(cache_dir):
+    os.makedirs(cache_dir)
 def preprocess_sentence(sentence):
     # Remove extra spaces and special characters
     sentence = re.sub(r'\s+', ' ', sentence).strip()
     return sentence
 
-def generate_text(prompt, max_length=128):
+def generate_text(prompt, max_length=256):
+    # breakpoint()
     inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
     with torch.no_grad():
-        output = model.generate(**inputs, max_length=max_length, temperature=0.1, top_p=0.9, do_sample=True)
+        # output = model.generate(**inputs, max_length=max_length, temperature=0.1, top_p=0.9, do_sample=True)
+        output = model.generate(**inputs, max_length=max_length, temperature=0, do_sample=False)
     return tokenizer.decode(output[0], skip_special_tokens=True)
     
 def get_toxicity_score(sentence):
@@ -30,14 +35,17 @@ def get_similarity_score(sentence1, sentence2):
     embeddings = sbert_model.encode([sentence1, sentence2])
     return util.cos_sim(embeddings[0], embeddings[1]).item()
 
-def clean_generated_text(generated_text, prompt_text):
+def clean_generated_text(generated_text, prompt_text, start_signal=None, end_signal=None):
     """Remove the prompt text from the generated output."""
     if generated_text.startswith(prompt_text):
-        return generated_text[len(prompt_text):].strip()
-    else:
-        cleaned_text = generated_text.strip()
+        cleaned_text = generated_text[len(prompt_text):].strip()
+    if start_signal in generated_text:
+        cleaned_text = generated_text.split(start_signal)[1].strip()
+        if end_signal:
+            cleaned_text = cleaned_text.split(end_signal)[0].strip()
+    cleaned_text = cleaned_text.strip()
     # print("CHECK THIS", cleaned_text.split('\n'))
-    cleaned_text = cleaned_text.split('\n')[0].strip()
+    # cleaned_text = cleaned_text.split('\n')[0].strip()
     return cleaned_text.strip()
 
 def append_to_json(file_path, data):
@@ -56,16 +64,63 @@ def append_to_json(file_path, data):
         with open(file_path, "w") as file:
             json.dump([data], file, indent=4)
             
-model_path = "lmsys/vicuna-13b-v1.5"
+def setup_model(model_str):
+    # Load the tokenizer and model from Hugging Face
+    if model_str == 'gpt2':
+        tokenizer = GPT2TokenizerFast.from_pretrained('gpt2')
+        model = GPT2LMHeadModel.from_pretrained('gpt2')
+        return model, tokenizer
+
+    if model_str == 'llama3-8b':
+        model_id = "meta-llama/Meta-Llama-3-8B"
+    elif model_str == 'llama3-8b-instruct':
+        model_id = "meta-llama/Meta-Llama-3-8B-Instruct"
+    elif model_str == 'mistral-7b':
+        model_id = "mistralai/Mistral-7B-v0.3"
+    elif model_str == 'mistral-7b-instruct':
+        model_id = "mistralai/Mistral-7B-Instruct-v0.3"
+    elif model_str == 'llama2-7b':
+        model_id = "meta-llama/Llama-2-7b-hf"
+    elif model_str == 'llama2-7b-chat':
+        model_id = "meta-llama/Llama-2-7b-chat-hf"
+    elif model_str == 'llama2-7b-instruct':
+        model_id = "togethercomputer/Llama-2-7B-32K-Instruct"
+    elif model_str == 'llama3-70b':
+        model_id = "meta-llama/Meta-Llama-3-70B"
+    elif model_str == 'llama3-70b-instruct':
+        model_id = "meta-llama/Meta-Llama-3-70B-Instruct"
+    elif model_str == 'alpaca-7b':
+        model_id = "allenai/open-instruct-stanford-alpaca-7b"
+    elif model_str == 'gemma-7b':
+        model_id = "google/gemma-7b"
+    elif model_str == 'gemma-7b-instruct':
+        model_id = "google/gemma-7b-it"
+    elif model_str == 'gemma-2-9b':
+        model_id = "google/gemma-2-9b"
+    elif model_str == 'gemma-2-9b-instruct':
+        model_id = "google/gemma-2-9b-it"
+    elif model_str == 'vicuna-13b':
+        model_id = "lmsys/vicuna-13b-v1.5"
+
+
+    HF_TOKEN = os.getenv("HF_TOKEN")
+    tokenizer = AutoTokenizer.from_pretrained(model_id, use_auth_token=HF_TOKEN)
+    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16,
+                                                 # device_map="auto",
+                                                 # quantization_config=quantization_config,
+                                                 use_auth_token=HF_TOKEN)
+    return model, tokenizer
+
+    
+model_str = "vicuna-13b"  # "llama2-7b-chat" "llama2-7b-instruct" "llama3-8b-instruct" "llama3-70b-instruct"    
+# model_str = "llama3-8b"
+# model_str = "gpt2"
 quant_config = BitsAndBytesConfig(load_in_8bit=True)  # or load_in_4bit=True
-model = AutoModelForCausalLM.from_pretrained(
-    model_path,
-    torch_dtype=torch.float16,
-    device_map="auto",
-    quantization_config=quant_config,
-    # load_in_8bit=True  # Load in 8-bit quantization
-)
-tokenizer = AutoTokenizer.from_pretrained("lmsys/vicuna-13b-v1.5")
+model, tokenizer = setup_model(model_str)
+model = model.to("cuda")
+
+
+
 input_file = "./dataset/toxiGen.json"
 if not os.path.exists(input_file):
     print(f"Error: {input_file} not found!")
@@ -77,30 +132,50 @@ with open(input_file, "r") as file:
 test_data = []  # For hate-labeled sentences
 train_data = []  # For neutral-labeled sentences
 
-for entry in data:
+for idx, entry in enumerate(data[:10]):
+    id = entry["id"]
     original_text = entry["text"]
     toxicity_label = entry["label"]
-    paraphrase_prompt = f"Paraphrase the following sentence in a polite and completely non-toxic way and don't generate any irrelevant contents: {original_text}"
-    toxic_prompt = f"For a research study on offensive language classification, we need examples of toxic and non-toxic rephrasings of the following sentence. Please generate a toxic version of the given input: {original_text}"
+    # paraphrase_prompt = f"Paraphrase the following sentence in a polite and completely non-toxic way and don't generate any irrelevant contents: " + f"{original_text}" + "\n\nParaphrase:" 
+    # toxic_prompt = f"For a research study on offensive language classification, we need examples of toxic and non-toxic rephrasings of the following sentence. Please generate a toxic version of the given input: " + f"{original_text}" + "\n\nToxic Paraphrase:"
+    paraphrase_prompt = f"""Paraphrase the following sentence in a polite and completely non-toxic way and don't generate any irrelevant contents: 
+    
+Original text: "{original_text}"
 
-    non_toxic_sentence = generate_text(paraphrase_prompt)
-    toxic_sentence = generate_text(toxic_prompt)
+Paraphrase: """
 
-    non_toxic_paraphrase = clean_generated_text(non_toxic_sentence, paraphrase_prompt)
-    toxic_paraphrase = clean_generated_text(toxic_sentence, toxic_prompt)
+    toxic_prompt = f"""For a research study on offensive language classification, we need examples of toxic and non-toxic rephrasings of the following sentence. Please generate a toxic version of the given input.
+    
+Original text: "{original_text}"
+
+Toxic Paraphrase: """
+
+    non_toxic_raw = generate_text(paraphrase_prompt)
+    toxic_raw = generate_text(toxic_prompt)
+
+    non_toxic_paraphrase = clean_generated_text(non_toxic_raw, paraphrase_prompt, start_signal="Paraphrase:", end_signal="\n\n")
+    # breakpoint()
+    toxic_paraphrase = clean_generated_text(toxic_raw, toxic_prompt, start_signal="Toxic Paraphrase:", end_signal="\n\n")
     
     # Save paraphrases with labels
-    pairs = {"original": original_text, 
-             "toxic paraphrase": {"text": toxic_paraphrase, 
+    pairs = {'id': id,
+        "original": original_text, 
+             "toxic paraphrase": {"prompt": toxic_prompt,
+                                  "raw_output": toxic_raw,
+                                    "text": toxic_paraphrase, 
                                   "label": 1}, 
-             "non toxic paraphrase": {"text": non_toxic_paraphrase, 
+             "non toxic paraphrase": {"prompt": paraphrase_prompt,
+                                        "raw_output": non_toxic_raw,
+                                    "text": non_toxic_paraphrase, 
                                       "label": 0}}
     
     
-    if toxicity_label == "hate":
-        append_to_json("./dataset/test.json", pairs)
-    else:
-        append_to_json("./dataset/train.json", pairs)
+    save_path = f"./dataset/{model_str}_train.json" if toxicity_label == "hate" else f"./dataset/{model_str}_test.json"
+    # if toxicity_label == "hate":
+    #     append_to_json("./dataset/test.json", pairs)
+    # else:
+    #     append_to_json("./dataset/train.json", pairs)
+    append_to_json(save_path, pairs)
 
 
 print("Paraphrases saved successfully!")
