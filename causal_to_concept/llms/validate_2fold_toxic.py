@@ -14,7 +14,7 @@ from transformers import LlamaForCausalLM, LlamaTokenizer, AutoTokenizer
 
 import sys
 sys.path.append('../')
-from utils_toxic import alt_tqa_evaluate, flattened_idx_to_layer_head, layer_head_to_flattened_idx, get_interventions_dict, get_top_heads, get_separated_activations, get_com_directions
+from utils_toxic import alt_tqa_evaluate, flattened_idx_to_layer_head, layer_head_to_flattened_idx, get_interventions_dict, get_top_heads, get_separated_activations, get_com_directions, get_activations
 from utils_toxic import get_special_directions, get_matrix_directions
 # import llama
 
@@ -40,8 +40,8 @@ def main():
     parser.add_argument("model_name", type=str, default='llama_1B', choices=HF_NAMES.keys(), help='model name')
     parser.add_argument("--model_dir", type=str, default=None, help='local directory with model data')
     parser.add_argument('--use_honest', action='store_true', help='use local editted version of the model', default=False)
-    parser.add_argument('--dataset_name', type=str, default='toxigen', help='feature bank for training probes')
-    parser.add_argument('--activations_dataset', type=str, default='toxigen', help='feature bank for calculating std along direction')
+    parser.add_argument('--dataset_name', type=str, default='toxigen_vicuna', help='feature bank for training probes')
+    parser.add_argument('--activations_dataset', type=str, default='toxigen_vicuna', help='feature bank for calculating std along direction')
     parser.add_argument('--num_heads', type=int, default=48, help='K, number of top heads to intervene on')
     parser.add_argument('--alpha', type=float, default=15, help='alpha, intervention strength')
     parser.add_argument("--num_fold", type=int, default=2, help="number of folds")
@@ -67,6 +67,8 @@ def main():
     elif args.dataset_name == "hate":
         dataset = load_dataset("json", data_files="../../dataset/implicitHate.json")["train"]
         df = pd.read_csv(f'./TruthfulQA/shuffled_{args.dataset_name}.csv')
+    elif args.dataset_name == "hate_vicuna" or args.dataset_name == "toxigen_vicuna":
+        df = pd.read_csv(f'./TruthfulQA/{args.model_name}_{args.dataset_name}.csv')
 
     # shuffle data to avoid class imbalance
     # np.random.seed(42)
@@ -76,7 +78,7 @@ def main():
     # df.to_csv(f'./TruthfulQA/shuffled_{args.dataset_name}.csv')
     # df.to_json("../../dataset/shuffled_implicitHate.json", orient="records", lines=False)
     # get two folds using numpy
-    fold_idxs = np.array_split(np.arange(len(df))[:100], args.num_fold)
+    fold_idxs = np.array_split(np.arange(len(df)), args.num_fold)
 
 
     # create model
@@ -129,12 +131,18 @@ def main():
         # tuning_labels = tuning_labels[indices]
         # np.save(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy", tuning_labels)
 
-    separated_head_wise_activations, separated_labels, idxs_to_split_at = get_separated_activations(labels, head_wise_activations, categories[:100], args.dataset_name)
-    # check duplicates
-    for item in separated_labels:
-        if len(set(item)) == 1:
-            print("WRONG")
-            break
+    elif args.dataset_name == "hate_vicuna" or args.dataset_name == "toxigen_vicuna":
+        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")
+        head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
+        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy")
+        
+        activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
+        tuning_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_head_wise.npy")
+        tuning_activations = rearrange(tuning_activations, 'b l (h d) -> b l h d', h = num_heads)
+        tuning_labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_labels.npy")
+        
+    # separated_head_wise_activations, separated_labels, idxs_to_split_at = get_separated_activations(labels, head_wise_activations, categories[:100], args.dataset_name)
+    separated_head_wise_activations, separated_labels, idxs_to_split_at = get_activations(labels, head_wise_activations, args.dataset_name, args.model_name)
     # run k-fold cross validation
     results = []
     for i in range(args.num_fold):
@@ -149,9 +157,9 @@ def main():
         val_set_idxs = np.array([x for x in train_idxs if x not in train_set_idxs])
 
         # save train and test splits
-        df.iloc[train_set_idxs].to_csv(f"splits/shuffled_{args.dataset_name}_fold_{i}_train_seed_{args.seed}.csv", index=False)
-        df.iloc[val_set_idxs].to_csv(f"splits/shuffled_{args.dataset_name}_fold_{i}_val_seed_{args.seed}.csv", index=False)
-        df.iloc[test_idxs].to_csv(f"splits/shuffled_{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv", index=False)
+        df.iloc[train_set_idxs].to_csv(f"splits/{args.dataset_name}_fold_{i}_train_seed_{args.seed}.csv", index=False)
+        df.iloc[val_set_idxs].to_csv(f"splits/{args.dataset_name}_fold_{i}_val_seed_{args.seed}.csv", index=False)
+        df.iloc[test_idxs].to_csv(f"splits/{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv", index=False)
 
         # get directions
         if args.use_center_of_mass:
@@ -251,6 +259,10 @@ def main():
             output_path = f'results_dump/answer_dump/shuffled_{args.dataset_name}_{filename}.csv'
             summary_path = f'results_dump/summary_dump/shuffled_{args.dataset_name}_{filename}.csv'
         elif args.dataset_name == 'toxigen':
+            input_path = f'splits/{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv'
+            output_path = f'results_dump/answer_dump/{args.dataset_name}_{filename}.csv'
+            summary_path = f'results_dump/summary_dump/{args.dataset_name}_{filename}.csv'
+        elif args.dataset_name == 'toxigen_vicuna' or args.dataset_name == 'hate_vicuna':
             input_path = f'splits/{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv'
             output_path = f'results_dump/answer_dump/{args.dataset_name}_{filename}.csv'
             summary_path = f'results_dump/summary_dump/{args.dataset_name}_{filename}.csv'

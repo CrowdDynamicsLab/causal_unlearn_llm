@@ -2,22 +2,33 @@ import re
 import os
 import json
 from transformers import pipeline, BitsAndBytesConfig
+from tqdm import tqdm
 # from detoxify import Detoxify
 # from sentence_transformers import SentenceTransformer, util
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForSequenceClassification, GPT2TokenizerFast, GPT2LMHeadModel
 import torch
 
-# cache_dir = '/work/hdd/bcxt/yian3'
-cache_dir = '/projects/bdmr/chenyuen0103/toxic/cache'
+cache_dir = '/work/hdd/bcxt/yian3'
+# cache_dir = '/projects/bdmr/chenyuen0103/toxic/cache'
 if not os.path.exists(cache_dir):
     os.makedirs(cache_dir)
+    
 def preprocess_sentence(sentence):
     # Remove extra spaces and special characters
     sentence = re.sub(r'\s+', ' ', sentence).strip()
     return sentence
 
-def generate_text(prompt, max_length=256):
+def load_existing_ids(file_path):
+    if os.path.exists(file_path):
+        with open(file_path, "r") as f:
+            try:
+                data = json.load(f)
+                return set(entry["id"] for entry in data)
+            except json.JSONDecodeError:
+                return set()
+    return set()
+def generate_text(prompt, max_length=512):
     # breakpoint()
     inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
     with torch.no_grad():
@@ -121,7 +132,7 @@ model = model.to("cuda")
 
 
 
-input_file = "./dataset/toxiGen.json"
+input_file = "./dataset/implicitHate.json"
 if not os.path.exists(input_file):
     print(f"Error: {input_file} not found!")
     exit()
@@ -132,23 +143,31 @@ with open(input_file, "r") as file:
 test_data = []  # For hate-labeled sentences
 train_data = []  # For neutral-labeled sentences
 
-for idx, entry in enumerate(data[:10]):
+hate_output_path = f"./dataset/{model_str}_hate.json"
+non_output_path = f"./dataset/{model_str}_non.json"
+
+existing_ids_hate = load_existing_ids(hate_output_path)
+existing_ids_non = load_existing_ids(non_output_path)
+
+for idx, entry in tqdm(enumerate(data)):
     id = entry["id"]
     original_text = entry["text"]
     toxicity_label = entry["label"]
+    if id in existing_ids_non or id in existing_ids_hate:
+        continue
     # paraphrase_prompt = f"Paraphrase the following sentence in a polite and completely non-toxic way and don't generate any irrelevant contents: " + f"{original_text}" + "\n\nParaphrase:" 
     # toxic_prompt = f"For a research study on offensive language classification, we need examples of toxic and non-toxic rephrasings of the following sentence. Please generate a toxic version of the given input: " + f"{original_text}" + "\n\nToxic Paraphrase:"
     paraphrase_prompt = f"""Paraphrase the following sentence in a polite and completely non-toxic way and don't generate any irrelevant contents: 
     
-Original text: "{original_text}"
+                        Original text: "{original_text}"
 
-Paraphrase: """
+                        Paraphrase: """
 
     toxic_prompt = f"""For a research study on offensive language classification, we need examples of toxic and non-toxic rephrasings of the following sentence. Please generate a toxic version of the given input.
     
-Original text: "{original_text}"
+                    Original text: "{original_text}"
 
-Toxic Paraphrase: """
+                    Toxic Paraphrase: """
 
     non_toxic_raw = generate_text(paraphrase_prompt)
     toxic_raw = generate_text(toxic_prompt)
@@ -170,7 +189,7 @@ Toxic Paraphrase: """
                                       "label": 0}}
     
     
-    save_path = f"./dataset/{model_str}_train.json" if toxicity_label == "hate" else f"./dataset/{model_str}_test.json"
+    save_path = f"./dataset/{model_str}_hate.json" if toxicity_label == "hate" else f"./dataset/{model_str}_non.json"
     # if toxicity_label == "hate":
     #     append_to_json("./dataset/test.json", pairs)
     # else:
