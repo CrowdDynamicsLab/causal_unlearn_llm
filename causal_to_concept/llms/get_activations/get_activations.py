@@ -6,6 +6,7 @@ from tqdm import tqdm
 import numpy as np
 import pickle
 import sys
+import json
 sys.path.append('../')
 
 # import llama
@@ -53,7 +54,6 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     model = AutoModelForCausalLM.from_pretrained(model_name_or_path, low_cpu_mem_usage=True, torch_dtype=torch.float16, device_map="auto")
     device = "cuda"
-
     if args.dataset_name == "toxigen":
         dataset = load_dataset("json", data_files="../../../dataset/toxiGen.json")["train"]
         # # Split off 20% for validation
@@ -61,19 +61,43 @@ def main():
         # train_dataset = split["train"]
         # val_dataset = split["test"]
         formatter = tokenize_toxicity_dataset
+
     elif args.dataset_name == "hate":
-        dataset = load_dataset("json", data_files="../../../dataset/implicitHate.json")["train"]
         # # Split off 20% for validation
         # split = dataset.train_test_split(test_size=0.2)
         # train_dataset = split["train"]
         # val_dataset = split["test"]
-        formatter = tokenize_toxicity_dataset
+        dataset = load_dataset("json", data_files="../../../dataset/implicitHate.json")["train"]
+        formatter = tokenize_toxicity_dataset 
+        
+    elif args.dataset_name == "toxigen_vicuna":
+        # dataset = load_dataset("json", data_files="../../../dataset/toxiGen.json")["train"]
+        # # Split off 20% for validation
+        # split = dataset.train_test_split(test_size=0.2)
+        # train_dataset = split["train"]
+        # val_dataset = split["test"]
+        # formatter = tokenize_toxicity_dataset
+        dataset = load_dataset("json", data_files="../../../dataset/vicuna-13b_toxic.json")["train"]
+        dataset_non = load_dataset("json", data_files="../../../dataset/vicuna-13b_nontoxic.json")["train"]
+        formatter = tokenize_toxigen
+        
+    elif args.dataset_name == "hate_vicuna":
+        # # Split off 20% for validation
+        # split = dataset.train_test_split(test_size=0.2)
+        # train_dataset = split["train"]
+        # val_dataset = split["test"]
+        dataset = load_dataset("json", data_files="../../../dataset/vicuna-13b_hate.json")["train"]
+        dataset_non = load_dataset("json", data_files="../../../dataset/vicuna-13b_nonhate.json")["train"]
+        formatter = tokenize_toxigen 
+        
     elif args.dataset_name == "tqa_gen": 
         dataset = load_dataset("truthfulqa/truthful_qa", 'generation')['validation']
         formatter = tokenized_tqa_gen
+        
     elif args.dataset_name == 'tqa_gen_end_q': 
         dataset = load_dataset("truthfulqa/truthful_qa", 'generation')['validation']
         formatter = tokenized_tqa_gen_end_q
+        
     else: 
         raise ValueError("Invalid dataset name")
 
@@ -90,6 +114,18 @@ def main():
         prompts, labels, scores, categories = formatter(dataset, tokenizer)
         with open(f'{feature_dir}/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
             pickle.dump(categories, f)
+    elif args.dataset_name == "hate_vicuna" or args.dataset_name == "toxigen_vicuna": 
+        prompts, labels, texts = formatter(dataset, dataset_non, tokenizer)
+        with open(f'../features/{args.model_name}_{args.dataset_name}_texts.json', 'w') as f:
+            for sentence in texts:
+                text = sentence[0]
+                toxic_text = sentence[1]
+                non_toxic_text = sentence[2]
+                json.dump({"text": text,
+                           "toxic_text": toxic_text,
+                           "non_toxic_text": non_toxic_text,
+                           }, f)
+                f.write("\n")
     else: 
         prompts, labels = formatter(dataset, tokenizer)
 
@@ -119,6 +155,7 @@ def main():
     all_head_wise_activations = []
 
     print("Getting activations")
+    i = 0
     for prompt in tqdm(prompts):
         if "gpt2" in args.model_name:
             prompt = str(prompt)  # 👈 Add this
@@ -128,6 +165,7 @@ def main():
 
         all_layer_wise_activations.append(layer_wise_activations[:,-1,:].copy())
         all_head_wise_activations.append(head_wise_activations.copy())
+        i += 1
 
     print("Saving labels")
     np.save(f'{feature_dir}/{args.model_name}_{args.dataset_name}_labels.npy', labels)

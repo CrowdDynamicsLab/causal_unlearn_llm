@@ -1,5 +1,7 @@
+
 # python get_activations.py --model_name llama_7B --dataset_name toxigen
 # python get_activations.py --model_name llama_7B --dataset_name hate
 
-python get_activations.py --model_name tiny_gpt2 --dataset_name toxigen
-python get_activations.py --model_name tiny_gpt2 --dataset_name hate
+python get_activations.py --model_name llama_7B --dataset_name toxigen_vicuna
+python get_activations.py --model_name llama_7B --dataset_name hate_vicuna
+

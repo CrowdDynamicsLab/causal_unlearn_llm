@@ -4,3 +4,10 @@ causal_to_concept/
 causality-lab/
 
 */__pycache__
+causal_to_concept/clip
+causality-lab/
+causal_to_concept/synthetic
+causal_to_concept/llms/features
+causal_to_concept/llms/splits
+dataset
+features

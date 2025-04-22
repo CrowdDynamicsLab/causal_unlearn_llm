@@ -183,6 +183,45 @@ def tokenize_toxicity_dataset(dataset, tokenizer):
 
     return all_prompts, all_labels, all_scores, all_categories
 
+def tokenize_toxigen(dataset, dataset_non, tokenizer):
+    all_prompts = []
+    all_labels = []
+    all_text = []
+    print("start tokenizing")
+    for i in tqdm(range(len(dataset))):
+        toxic_text = dataset['toxic paraphrase'][i]['text']
+        non_toxic_text = dataset['non toxic paraphrase'][i]['text']
+        text = dataset['original'][i]
+        toxic_prompt = tokenizer(toxic_text, return_tensors='pt').input_ids
+        non_toxic_prompt = tokenizer(non_toxic_text, return_tensors='pt').input_ids
+        if len(toxic_prompt[0]) == 1 or len(non_toxic_prompt[0]) == 1:
+            continue
+        toxic_label = 1
+        non_toxic_label = 0
+        all_prompts.append(toxic_prompt)
+        all_labels.append(toxic_label)
+        all_prompts.append(non_toxic_prompt)
+        all_labels.append(non_toxic_label)
+        all_text.append((text, toxic_text, non_toxic_text))
+    
+    for i in tqdm(range(len(dataset_non))):
+        toxic_text = dataset_non['toxic paraphrase'][i]['text']
+        non_toxic_text = dataset_non['non toxic paraphrase'][i]['text']
+        text = dataset_non['original'][i]
+        toxic_prompt = tokenizer(toxic_text, return_tensors='pt').input_ids
+        non_toxic_prompt = tokenizer(non_toxic_text, return_tensors='pt').input_ids
+        if len(toxic_prompt[0]) == 1 or len(non_toxic_prompt[0]) == 1:
+            continue
+        toxic_label = 1
+        non_toxic_label = 0
+        all_prompts.append(toxic_prompt)
+        all_labels.append(toxic_label)
+        all_prompts.append(non_toxic_prompt)
+        all_labels.append(non_toxic_label)
+        all_text.append((text, toxic_text, non_toxic_text))
+
+    return all_prompts, all_labels, all_text
+
 def get_llama_activations_bau(model, prompt, device): 
     HEADS = [f"model.layers.{i}.self_attn.head_out" for i in range(model.config.num_hidden_layers)]
     MLPS = [f"model.layers.{i}.mlp" for i in range(model.config.num_hidden_layers)]
