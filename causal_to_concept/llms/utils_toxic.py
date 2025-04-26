@@ -1,6 +1,6 @@
 import os
 import sys
-sys.path.insert(0, "TruthfulQA")
+# sys.path.insert(0, "TruthfulQA")
 
 import torch
 import torch.nn as nn
@@ -22,9 +22,9 @@ from functools import partial
 from pprint import pprint
 from sentence_transformers import SentenceTransformer
 
-from truthfulqa import utilities, models, metrics
+from TruthfulQA.truthfulqa import utilities, models, metrics
 import openai
-from truthfulqa.configs import BEST_COL, ANSWER_COL, INCORRECT_COL
+from TruthfulQA.truthfulqa.configs import BEST_COL, ANSWER_COL, INCORRECT_COL
 
 sentence_embedding = SentenceTransformer('all-MiniLM-L6-v2')
 
@@ -39,16 +39,16 @@ ENGINE_MAP = {
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
 }
 
-from truthfulqa.utilities import (
+from TruthfulQA.truthfulqa.utilities import (
     format_prompt,
     format_prompt_with_answer_strings,
     split_multi_answer,
     format_best,
     find_start,
 )
-from truthfulqa.presets import preset_map, COMPARE_PRIMER
-from truthfulqa.models import find_subsequence, set_columns, MC_calcs
-from truthfulqa.evaluates import format_frame, data_to_dict
+from TruthfulQA.truthfulqa.presets import preset_map, COMPARE_PRIMER
+from TruthfulQA.truthfulqa.models import find_subsequence, set_columns, MC_calcs
+from TruthfulQA.truthfulqa.evaluates import format_frame, data_to_dict
 
 
 def load_nq():
@@ -267,6 +267,7 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
             # --- intervention code --- #
             with TraceDict(model, layers_to_intervene, edit_output=intervene) as ret: 
                 input_ids = input_ids.to(model.device)
+
                 # model = model.to(torch.float32)
                 model_gen_tokens = model.generate(input_ids, top_k=10, max_length=max_len, num_return_sequences=1,min_new_tokens=10, )[:, input_ids.shape[-1]:]
 

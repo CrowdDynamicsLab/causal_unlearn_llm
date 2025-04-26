@@ -8,7 +8,8 @@ import pandas as pd
 import numpy as np
 import argparse
 from datasets import load_dataset
-from transformers import LlamaForCausalLM, LlamaTokenizer, AutoTokenizer
+from transformers import LlamaForCausalLM, LlamaTokenizer, AutoTokenizer, GPT2LMHeadModel
+
 # from accelerate import Accelerator
 # accelerator = Accelerator()
 
@@ -32,13 +33,18 @@ HF_NAMES = {
     'llama2_chat_13B': 'meta-llama/Llama-2-13b-chat-hf', 
     'honest_llama2_chat_13B': 'results_dump/llama2_chat_13B_seed_42_top_48_heads_alpha_15', 
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
+<<<<<<< HEAD
     'honest_llama2_chat_70B': 'results_dump/llama2_chat_70B_seed_42_top_48_heads_alpha_15', 
     'vicuna_13b': 'lmsys/vicuna-13b-v1.5',
+=======
+    'honest_llama2_chat_70B': 'results_dump/llama2_chat_70B_seed_42_top_48_heads_alpha_15',
+    'tiny_gpt2':"sshleifer/tiny-gpt2",
+>>>>>>> fd4f7dfddf3d9f9d8a8a6e19f71e2cab31162adb
 }
 
 def main(): 
     parser = argparse.ArgumentParser()
-    parser.add_argument("model_name", type=str, default='llama_1B', choices=HF_NAMES.keys(), help='model name')
+    parser.add_argument("--model_name", type=str, default='llama_7B', choices=HF_NAMES.keys(), help='model name')
     parser.add_argument("--model_dir", type=str, default=None, help='local directory with model data')
     parser.add_argument('--use_honest', action='store_true', help='use local editted version of the model', default=False)
     parser.add_argument('--dataset_name', type=str, default='toxigen_vicuna', help='feature bank for training probes')
@@ -49,8 +55,8 @@ def main():
     parser.add_argument('--val_ratio', type=float, help='ratio of validation set size to development set size', default=0.2)
     parser.add_argument('--use_center_of_mass', action='store_true', help='use center of mass direction', default=False)
     parser.add_argument('--use_random_dir', action='store_true', help='use random direction', default=False)
-    parser.add_argument('--device', type=str, default="0")
-    parser.add_argument('--seed', type=int, default=42, help='seed')
+    parser.add_argument('--device', type=int, default=0, help='device')
+    parser.add_argument('--seed', type=int, default=0, help='seed')
     parser.add_argument('--judge_name', type=str, required=False)
     parser.add_argument('--info_name', type=str, required=False)
     parser.add_argument('--use_special_direction', action='store_true', default=False)
@@ -85,38 +91,51 @@ def main():
     # create model
     model_name = HF_NAMES["honest_" + args.model_name if args.use_honest else args.model_name]
     MODEL = model_name if not args.model_dir else args.model_dir
-    if args.model_name == 'llama_1B' or args.model_name == 'llama_3B':
+
+    if "gpt2" in args.model_name:
         tokenizer = AutoTokenizer.from_pretrained(MODEL)
+        model = GPT2LMHeadModel.from_pretrained(
+            MODEL, low_cpu_mem_usage=True, torch_dtype=torch.float16, device_map="auto"
+        )
     else:
-        tokenizer = LlamaTokenizer.from_pretrained(MODEL)
-    model = LlamaForCausalLM.from_pretrained(MODEL, low_cpu_mem_usage = True, torch_dtype=torch.float16, device_map="auto")
-    # model, tokenizer = accelerator.prepare(model, tokenizer)
+
+        if args.model_name == 'llama_1B' or args.model_name == 'llama_3B':
+            tokenizer = AutoTokenizer.from_pretrained(MODEL)
+        else:
+            tokenizer = LlamaTokenizer.from_pretrained(MODEL)
+        model = LlamaForCausalLM.from_pretrained(MODEL, low_cpu_mem_usage = True, torch_dtype=torch.float16, device_map="auto")
+    
     
     # define number of layers and heads
-    num_layers = model.config.num_hidden_layers
-    num_heads = model.config.num_attention_heads
+    try:
+        num_layers = model.config.num_hidden_layers
+        num_heads = model.config.num_attention_heads
+    except:
+        num_layers = 12  # default for tiny_gpt2
+        num_heads = 12    
     
     # load activations 
     if args.dataset_name == "toxigen":
-        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")[:100]
+
+        head_wise_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")[:6]
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
-        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy")[:100]
+        labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy")[:6]
+        print("LABELS", labels)
         with open(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl", "rb") as f:
             categories = pickle.load(f)  # List of target groups, 1 per sentence
-
         # tuning dataset: no labels used, just to get std of activations along the direction
         activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
-        tuning_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_head_wise.npy")[:100]
+        tuning_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_head_wise.npy")[:6]
         tuning_activations = rearrange(tuning_activations, 'b l (h d) -> b l h d', h = num_heads)
-        tuning_labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_labels.npy")[:100]
-        
+        tuning_labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_labels.npy")[:6]
+
     elif args.dataset_name == "hate":
-        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy")
+        head_wise_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy")
         # head_wise_activations = head_wise_activations[indices]
-        # np.save(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy", head_wise_activations)
-        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy")
+        # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy", head_wise_activations)
+        labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy")
         # labels = labels[indices]
-        # np.save(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy", labels)
+        # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy", labels)
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
         with open(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl", "rb") as f:
             categories = pickle.load(f)  # List of target groups, 1 per sentence
@@ -124,13 +143,13 @@ def main():
 
         # tuning dataset: no labels used, just to get std of activations along the direction
         activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
-        tuning_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy")
+        tuning_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy")
         # tuning_activations = tuning_activations[indices]
-        # np.save(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy", tuning_activations)
+        # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy", tuning_activations)
         tuning_activations = rearrange(tuning_activations, 'b l (h d) -> b l h d', h = num_heads)
-        tuning_labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy")
+        tuning_labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy")
         # tuning_labels = tuning_labels[indices]
-        # np.save(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy", tuning_labels)
+        # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy", tuning_labels)
 
     elif args.dataset_name == "hate_vicuna" or args.dataset_name == "toxigen_vicuna":
         head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")
@@ -162,6 +181,7 @@ def main():
         df.iloc[val_set_idxs].to_csv(f"splits/{args.dataset_name}_fold_{i}_val_seed_{args.seed}.csv", index=False)
         df.iloc[test_idxs].to_csv(f"splits/{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv", index=False)
 
+<<<<<<< HEAD
         # # get directions
         # if args.use_center_of_mass:
         #     com_directions = get_com_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
@@ -172,6 +192,20 @@ def main():
         # else:
         #     com_directions = None
         # print("Finished computing com_directions of shape", com_directions.shape)
+=======
+        # get directions
+        if args.use_center_of_mass:
+            com_directions = get_com_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
+        elif args.use_special_direction:
+            com_directions = get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, df)
+        elif args.use_mat_direction:
+            com_directions = get_matrix_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
+        else:
+            com_directions = None
+
+        # breakpoint()
+        print("Finished computing com_directions of shape", com_directions.shape)
+>>>>>>> fd4f7dfddf3d9f9d8a8a6e19f71e2cab31162adb
 
         top_heads, probes = get_top_heads(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, num_layers, num_heads, args.seed, args.num_heads, args.use_random_dir)
         np.save(f'./features/{args.model_name}_{args.dataset_name}_top_heads.npy', top_heads)
@@ -188,7 +222,11 @@ def main():
             #     return torch.zeros_like(_head_output)
             head_output = _head_output.detach().type(torch.float32)
             head_output = rearrange(head_output, 'b s (h d) -> b s h d', h=num_heads)
-            layer = int(layer_name.split('.')[2])
+            if "gpt2" in args.model_name:
+                layer = int(layer_name.split('.')[1])  # e.g., 'transform.h.3'
+            else:
+                layer = int(layer_name.split('.')[2])
+
             # print("head output shape", head_output.shape)
             if prompt_encoding is not None: # use_special_direction
                 assert prompt_encoding.shape == (384,)
