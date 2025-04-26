@@ -711,7 +711,7 @@ def train_probes(seed, train_set_idxs, val_set_idxs, separated_head_wise_activat
     all_X_val = np.concatenate([separated_head_wise_activations[i] for i in val_set_idxs], axis = 0)
     y_train = np.concatenate([separated_labels[i] for i in train_set_idxs], axis = 0)
     y_val = np.concatenate([separated_labels[i] for i in val_set_idxs], axis = 0)
-    #print("==========SLICE=========", all_X_train.shape)
+    # print("==========SLICE=========", all_X_train.shape)
     for layer in tqdm(range(num_layers)): 
         for head in range(num_heads): 
             X_train = all_X_train[:,layer,head,:]
@@ -733,7 +733,6 @@ def get_top_heads(train_idxs, val_idxs, separated_activations, separated_labels,
     all_head_accs_np = all_head_accs_np.reshape(num_layers, num_heads)
 
     top_heads = []
-
     top_accs = np.argsort(all_head_accs_np.reshape(num_heads*num_layers))[::-1][:num_to_intervene]
     top_heads = [flattened_idx_to_layer_head(idx, num_heads) for idx in top_accs]
     if use_random_dir: 
@@ -841,7 +840,7 @@ def get_separated_activations(labels, head_wise_activations, categories, dataset
     return grouped_activations, grouped_labels, idxs_to_split_at
 
 def get_activations(labels, head_wise_activations, dataset, model_name): 
-    sentences = pd.read_csv(f'./TruthfulQA/{model_name}_{dataset}.csv')
+    sentences = pd.read_csv(f'./TruthfulQA/{dataset}.csv')
     texts = sentences["text"]
     toxic_texts = sentences["toxic_text"]
     non_toxic_texts = sentences["non_toxic_text"]
@@ -862,7 +861,7 @@ def get_activations(labels, head_wise_activations, dataset, model_name):
             continue
             
 
-        grouped_activations.append(np.stack(group_acts))  # (5, L, H, D)
+        grouped_activations.append(np.stack(group_acts))  # (2, L, H, D)
         grouped_labels.append(group_labels)
         idxs_to_split_at.append(len(grouped_activations) * 2)  # running total
 

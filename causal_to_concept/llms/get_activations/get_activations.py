@@ -31,7 +31,8 @@ HF_NAMES = {
     'llama3_8B': 'meta-llama/Meta-Llama-3-8B',
     'llama3_8B_instruct': 'meta-llama/Meta-Llama-3-8B-Instruct',
     'llama3_70B': 'meta-llama/Meta-Llama-3-70B',
-    'llama3_70B_instruct': 'meta-llama/Meta-Llama-3-70B-Instruct'
+    'llama3_70B_instruct': 'meta-llama/Meta-Llama-3-70B-Instruct',
+    'vicuna_13b': 'lmsys/vicuna-13b-v1.5',
 }
 
 def main(): 
@@ -103,15 +104,15 @@ def main():
     print("Tokenizing prompts")
     if args.dataset_name == "tqa_gen" or args.dataset_name == "tqa_gen_end_q": 
         prompts, labels, categories = formatter(dataset, tokenizer)
-        with open(f'../features/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
+        with open(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
             pickle.dump(categories, f)
     elif args.dataset_name == "hate" or args.dataset_name == "toxigen": 
         prompts, labels, scores, categories = formatter(dataset, tokenizer)
-        with open(f'../features/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
+        with open(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
             pickle.dump(categories, f)
     elif args.dataset_name == "hate_vicuna" or args.dataset_name == "toxigen_vicuna": 
         prompts, labels, texts = formatter(dataset, dataset_non, tokenizer)
-        with open(f'../features/{args.model_name}_{args.dataset_name}_texts.json', 'w') as f:
+        with open(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_texts.json', 'w') as f:
             for sentence in texts:
                 text = sentence[0]
                 toxic_text = sentence[1]
@@ -139,22 +140,23 @@ def main():
     all_head_wise_activations = []
 
     print("Getting activations")
+    print("number of layers", model.config.num_hidden_layers, len(collectors))
     i = 0
     for prompt in tqdm(prompts):
         layer_wise_activations, head_wise_activations, _ = get_llama_activations_pyvene(collected_model, collectors, prompt, device)
         # print(i, prompt, layer_wise_activations.shape)
-        all_layer_wise_activations.append(layer_wise_activations[:,-1,:].copy())
+        # all_layer_wise_activations.append(layer_wise_activations[:,-1,:].copy())
         all_head_wise_activations.append(head_wise_activations.copy())
         i += 1
 
-    print("Saving labels")
-    np.save(f'../features/{args.model_name}_{args.dataset_name}_labels.npy', labels)
+    # print("Saving labels")
+    # np.save(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy', labels)
 
-    print("Saving layer wise activations")
-    np.save(f'../features/{args.model_name}_{args.dataset_name}_layer_wise.npy', all_layer_wise_activations)
+    # print("Saving layer wise activations")
+    # np.save(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_layer_wise.npy', all_layer_wise_activations)
     
-    print("Saving head wise activations")
-    np.save(f'../features/{args.model_name}_{args.dataset_name}_head_wise.npy', all_head_wise_activations)
+    # print("Saving head wise activations")
+    # np.save(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy', all_head_wise_activations)
 
 if __name__ == '__main__':
     main()

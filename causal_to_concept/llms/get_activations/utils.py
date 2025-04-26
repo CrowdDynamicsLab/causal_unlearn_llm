@@ -3,6 +3,7 @@
 import os
 import sys
 sys.path.insert(0, "TruthfulQA")
+sys.path.append(os.path.dirname(__file__))
 
 import torch
 import torch.nn as nn
@@ -50,7 +51,7 @@ from truthfulqa.utilities import (
 )
 from truthfulqa.presets import preset_map, COMPARE_PRIMER
 from truthfulqa.models import find_subsequence, set_columns, MC_calcs
-from truthfulqa.evaluate import format_frame, data_to_dict
+from truthfulqa.evaluates import format_frame, data_to_dict
 
 
 def load_nq():
@@ -258,7 +259,9 @@ def get_llama_activations_pyvene(collected_model, collectors, prompt, device):
             head_wise_hidden_states.append(None)
         collector.reset()
     mlp_wise_hidden_states = []
+    print("SHAPES", len(head_wise_hidden_states), len(head_wise_hidden_states[0]))
     head_wise_hidden_states = torch.stack([torch.tensor(h) for h in head_wise_hidden_states], dim=0).squeeze().numpy()
+    print("SHAPES", head_wise_hidden_states.shape)
     return hidden_states, head_wise_hidden_states, mlp_wise_hidden_states
 
 def get_llama_logits(model, prompt, device): 

@@ -33,6 +33,7 @@ HF_NAMES = {
     'honest_llama2_chat_13B': 'results_dump/llama2_chat_13B_seed_42_top_48_heads_alpha_15', 
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
     'honest_llama2_chat_70B': 'results_dump/llama2_chat_70B_seed_42_top_48_heads_alpha_15', 
+    'vicuna_13b': 'lmsys/vicuna-13b-v1.5',
 }
 
 def main(): 
@@ -68,7 +69,7 @@ def main():
         dataset = load_dataset("json", data_files="../../dataset/implicitHate.json")["train"]
         df = pd.read_csv(f'./TruthfulQA/shuffled_{args.dataset_name}.csv')
     elif args.dataset_name == "hate_vicuna" or args.dataset_name == "toxigen_vicuna":
-        df = pd.read_csv(f'./TruthfulQA/{args.model_name}_{args.dataset_name}.csv')
+        df = pd.read_csv(f'./TruthfulQA/{args.dataset_name}.csv')
 
     # shuffle data to avoid class imbalance
     # np.random.seed(42)
@@ -161,18 +162,19 @@ def main():
         df.iloc[val_set_idxs].to_csv(f"splits/{args.dataset_name}_fold_{i}_val_seed_{args.seed}.csv", index=False)
         df.iloc[test_idxs].to_csv(f"splits/{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv", index=False)
 
-        # get directions
-        if args.use_center_of_mass:
-            com_directions = get_com_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
-        elif args.use_special_direction:
-            com_directions = get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, df)
-        elif args.use_mat_direction:
-            com_directions = get_matrix_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
-        else:
-            com_directions = None
-        print("Finished computing com_directions of shape", com_directions.shape)
+        # # get directions
+        # if args.use_center_of_mass:
+        #     com_directions = get_com_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
+        # elif args.use_special_direction:
+        #     com_directions = get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, df)
+        # elif args.use_mat_direction:
+        #     com_directions = get_matrix_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
+        # else:
+        #     com_directions = None
+        # print("Finished computing com_directions of shape", com_directions.shape)
 
         top_heads, probes = get_top_heads(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, num_layers, num_heads, args.seed, args.num_heads, args.use_random_dir)
+        np.save(f'./features/{args.model_name}_{args.dataset_name}_top_heads.npy', top_heads)
         print("Heads intervened: ", sorted(top_heads))
 
         interventions = get_interventions_dict(top_heads, probes, tuning_activations, num_heads, args.use_center_of_mass, args.use_random_dir, args.use_mat_direction, args.use_special_direction, com_directions)

@@ -14,7 +14,7 @@ python validate_2fold.py llama_7B --num_heads 72 --alpha 15 --seed 2 --device 0 
 
 python validate_2fold_toxic.py llama_7B --num_heads 72 --alpha 15 --seed 2 --device 0 --num_fold 2 --use_special_direction
 
-python validate_2fold_toxic.py llama_1B --num_heads 72 --alpha 15 --seed 2 --device 0 --num_fold 2 --use_special_direction
+python validate_2fold_toxic.py vicuna_13b --num_heads 72 --alpha 15 --seed 2 --device 0 --num_fold 2 --use_special_direction
 
 python validate_2fold_toxic.py llama_3B --num_heads 72 --alpha 15 --seed 2 --device 0 --num_fold 2 --use_special_direction
 
