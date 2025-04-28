@@ -33,18 +33,13 @@ HF_NAMES = {
     'llama2_chat_13B': 'meta-llama/Llama-2-13b-chat-hf', 
     'honest_llama2_chat_13B': 'results_dump/llama2_chat_13B_seed_42_top_48_heads_alpha_15', 
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
-<<<<<<< HEAD
     'honest_llama2_chat_70B': 'results_dump/llama2_chat_70B_seed_42_top_48_heads_alpha_15', 
-    'vicuna_13b': 'lmsys/vicuna-13b-v1.5',
-=======
-    'honest_llama2_chat_70B': 'results_dump/llama2_chat_70B_seed_42_top_48_heads_alpha_15',
-    'tiny_gpt2':"sshleifer/tiny-gpt2",
->>>>>>> fd4f7dfddf3d9f9d8a8a6e19f71e2cab31162adb
+    'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
 }
 
 def main(): 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default='llama_7B', choices=HF_NAMES.keys(), help='model name')
+    parser.add_argument("model_name", type=str, default='llama_7B', choices=HF_NAMES.keys(), help='model name')
     parser.add_argument("--model_dir", type=str, default=None, help='local directory with model data')
     parser.add_argument('--use_honest', action='store_true', help='use local editted version of the model', default=False)
     parser.add_argument('--dataset_name', type=str, default='toxigen_vicuna', help='feature bank for training probes')
@@ -62,8 +57,7 @@ def main():
     parser.add_argument('--use_special_direction', action='store_true', default=False)
     parser.add_argument('--use_mat_direction', action='store_true', default=False)
     args = parser.parse_args()
-    device_ids = list(map(int, args.device.split(",")))
-    # device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     # set seeds
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -85,6 +79,7 @@ def main():
     # df.to_csv(f'./TruthfulQA/shuffled_{args.dataset_name}.csv')
     # df.to_json("../../dataset/shuffled_implicitHate.json", orient="records", lines=False)
     # get two folds using numpy
+    # fold_idxs = np.array_split(np.arange(len(df))[:100], args.num_fold)
     fold_idxs = np.array_split(np.arange(len(df)), args.num_fold)
 
 
@@ -117,10 +112,9 @@ def main():
     # load activations 
     if args.dataset_name == "toxigen":
 
-        head_wise_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")[:6]
+        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")[:6]
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
-        labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy")[:6]
-        print("LABELS", labels)
+        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy")[:6]
         with open(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl", "rb") as f:
             categories = pickle.load(f)  # List of target groups, 1 per sentence
         # tuning dataset: no labels used, just to get std of activations along the direction
@@ -130,10 +124,10 @@ def main():
         tuning_labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_labels.npy")[:6]
 
     elif args.dataset_name == "hate":
-        head_wise_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy")
+        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy")
         # head_wise_activations = head_wise_activations[indices]
         # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy", head_wise_activations)
-        labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy")
+        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy")
         # labels = labels[indices]
         # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy", labels)
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
@@ -143,23 +137,23 @@ def main():
 
         # tuning dataset: no labels used, just to get std of activations along the direction
         activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
-        tuning_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy")
+        tuning_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy")
         # tuning_activations = tuning_activations[indices]
         # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy", tuning_activations)
         tuning_activations = rearrange(tuning_activations, 'b l (h d) -> b l h d', h = num_heads)
-        tuning_labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy")
+        tuning_labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy")
         # tuning_labels = tuning_labels[indices]
         # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy", tuning_labels)
 
     elif args.dataset_name == "hate_vicuna" or args.dataset_name == "toxigen_vicuna":
-        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")
+        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy") # [:200]
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
-        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy")
+        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy") # [:200]
         
         activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
-        tuning_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_head_wise.npy")
+        tuning_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_head_wise.npy") # [:200]
         tuning_activations = rearrange(tuning_activations, 'b l (h d) -> b l h d', h = num_heads)
-        tuning_labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_labels.npy")
+        tuning_labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_labels.npy") # [:200]
         
     # separated_head_wise_activations, separated_labels, idxs_to_split_at = get_separated_activations(labels, head_wise_activations, categories[:100], args.dataset_name)
     separated_head_wise_activations, separated_labels, idxs_to_split_at = get_activations(labels, head_wise_activations, args.dataset_name, args.model_name)
@@ -181,18 +175,6 @@ def main():
         df.iloc[val_set_idxs].to_csv(f"splits/{args.dataset_name}_fold_{i}_val_seed_{args.seed}.csv", index=False)
         df.iloc[test_idxs].to_csv(f"splits/{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv", index=False)
 
-<<<<<<< HEAD
-        # # get directions
-        # if args.use_center_of_mass:
-        #     com_directions = get_com_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
-        # elif args.use_special_direction:
-        #     com_directions = get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, df)
-        # elif args.use_mat_direction:
-        #     com_directions = get_matrix_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
-        # else:
-        #     com_directions = None
-        # print("Finished computing com_directions of shape", com_directions.shape)
-=======
         # get directions
         if args.use_center_of_mass:
             com_directions = get_com_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
@@ -205,10 +187,9 @@ def main():
 
         # breakpoint()
         print("Finished computing com_directions of shape", com_directions.shape)
->>>>>>> fd4f7dfddf3d9f9d8a8a6e19f71e2cab31162adb
 
         top_heads, probes = get_top_heads(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, num_layers, num_heads, args.seed, args.num_heads, args.use_random_dir)
-        np.save(f'./features/{args.model_name}_{args.dataset_name}_top_heads.npy', top_heads)
+        np.save(f'./features/{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_{i}_top_heads.npy', top_heads)
         print("Heads intervened: ", sorted(top_heads))
 
         interventions = get_interventions_dict(top_heads, probes, tuning_activations, num_heads, args.use_center_of_mass, args.use_random_dir, args.use_mat_direction, args.use_special_direction, com_directions)
@@ -281,7 +262,7 @@ def main():
             head_output = rearrange(head_output, 'b s h d -> b s (h d)')
             return head_output.type(torch.float16)
 
-        filename = f'{args.model_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{int(args.alpha)}_fold_{i}'
+        filename = f'{args.model_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_{i}'
 
         if args.use_center_of_mass:
             filename += '_com'
