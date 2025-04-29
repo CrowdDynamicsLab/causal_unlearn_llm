@@ -210,7 +210,7 @@ if __name__ == "__main__":
 
 # # Get scores
 # toxic_score = get_toxicity_score(clean_toxic)
-# non_toxic_score = get_toxicity_score(clean_non_toxic)
+non_toxic_score = get_toxicity_score(clean_non_toxic)
 
 # print("Toxicity Score (Toxic Sentence):", toxic_score)
 # print("Toxicity Score (Non-Toxic Sentence):", non_toxic_score)

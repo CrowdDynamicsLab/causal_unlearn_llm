@@ -10,3 +10,4 @@ causal_to_concept/llms/results_dump/
 causal_to_concept/llms/splits/
 causal_to_concept/llms/get_activations/__pycache__
 */__pycache__/
+causal_to_concept/llms/__pycache__/

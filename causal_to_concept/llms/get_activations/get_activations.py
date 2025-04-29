@@ -6,6 +6,7 @@ from tqdm import tqdm
 import numpy as np
 import pickle
 import sys
+import json
 sys.path.append('../')
 
 # import llama
@@ -14,7 +15,7 @@ import argparse
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
 
 # Specific pyvene imports
-from utils import get_llama_activations_pyvene, tokenized_tqa, tokenized_tqa_gen, tokenized_tqa_gen_end_q, tokenize_toxicity_dataset, get_gpt2_activations_pyvene
+from utils import tokenize_toxigen, get_llama_activations_pyvene, tokenized_tqa, tokenized_tqa_gen, tokenized_tqa_gen_end_q, tokenize_toxicity_dataset, get_gpt2_activations_pyvene
 from interveners import wrapper, Collector, ITI_Intervener
 import pyvene as pv
 
@@ -36,7 +37,6 @@ HF_NAMES = {
     'mistral-7b-instruct': "mistralai/Mistral-7B-Instruct-v0.3",
     'gemma-2-9b': "google/gemma-2-9b",
     'gemma-2-9b-instruct':"google/gemma-2-9b-it"
-
 }
 
 def main(): 
@@ -73,6 +73,29 @@ def main():
         # train_dataset = split["train"]
         # val_dataset = split["test"]
         formatter = tokenize_toxicity_dataset
+
+    elif args.dataset_name == "toxigen_vicuna":
+        # dataset = load_dataset("json", data_files="../../../dataset/toxiGen.json")["train"]
+        # # Split off 20% for validation
+        # split = dataset.train_test_split(test_size=0.2)
+        # train_dataset = split["train"]
+        # val_dataset = split["test"]
+        # formatter = tokenize_toxicity_dataset
+        dataset = load_dataset("json", data_files="../../../dataset/vicuna-13b_toxic.json")["train"]
+        dataset_non = load_dataset("json", data_files="../../../dataset/vicuna-13b_nontoxic.json")["train"]
+        dataset = load_dataset("json", data_files="causal_to_concept/llms/dataset/llama_7B_toxigen_vicuna_texts.json")
+        formatter = tokenize_toxigen
+        
+    elif args.dataset_name == "hate_vicuna":
+        # # Split off 20% for validation
+        # split = dataset.train_test_split(test_size=0.2)
+        # train_dataset = split["train"]
+        # val_dataset = split["test"]
+        dataset = load_dataset("json", data_files="../../../dataset/vicuna-13b_hate.json")["train"]
+        dataset_non = load_dataset("json", data_files="../../../dataset/vicuna-13b_nonhate.json")["train"]
+        dataset = load_dataset("json", data_files="causal_to_concept/llms/dataset/llama_7B_hate_vicuna_texts.json")
+        formatter = tokenize_toxigen 
+
     elif args.dataset_name == "tqa_gen": 
         dataset = load_dataset("truthfulqa/truthful_qa", 'generation')['validation']
         formatter = tokenized_tqa_gen
@@ -85,38 +108,42 @@ def main():
     print("Tokenizing prompts")
 
     feature_dir = f'/projects/bdeb/chenyuen0103/toxic/features'
+    sentence_dir = f'/projects/bdeb/chenyuen0103/toxic/sentences'
     if not os.path.exists(feature_dir):
         os.makedirs(feature_dir)
     if args.dataset_name == "tqa_gen" or args.dataset_name == "tqa_gen_end_q": 
         prompts, labels, categories = formatter(dataset, tokenizer)
-        with open(f'{feature_dir}/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
-            pickle.dump(categories, f)
+        # with open(f'{feature_dir}/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
+        #     pickle.dump(categories, f)
     elif args.dataset_name == "hate" or args.dataset_name == "toxigen": 
         prompts, labels, scores, categories = formatter(dataset, tokenizer)
-        with open(f'{feature_dir}/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
-            pickle.dump(categories, f)
+        # with open(f'{feature_dir}/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
+        #     pickle.dump(categories, f)
+    elif args.dataset_name == "hate_vicuna" or args.dataset_name == "toxigen_vicuna": 
+        prompts, labels, texts = formatter(dataset, dataset_non, tokenizer)
+        # with open(f'{feature_dir}/{args.model_name}_{args.dataset_name}_texts.json', 'w') as f:
+        #     for sentence in texts:
+        #         text = sentence[0]
+        #         toxic_text = sentence[1]
+        #         non_toxic_text = sentence[2]
+        #         json.dump({"text": text,
+        #                    "toxic_text": toxic_text,
+        #                    "non_toxic_text": non_toxic_text,
+        #                    }, f)
+        #         f.write("\n")
     else: 
         prompts, labels = formatter(dataset, tokenizer)
 
     collectors = []
     pv_config = []
-    if "gpt2" in args.model_name:
-        breakpoint()
-        for layer in range(model.config.n_layer):  # GPT-2 uses 'n_layer'
-            collector = Collector(multiplier=0, head=-1)  # No need for num_heads
-            collectors.append(collector)
-            pv_config.append({
-                "component": f"transformer.h[{layer}].attn.c_proj.input",  # GPT-2 equivalent
-                "intervention": wrapper(collector),
-            })
-    else:
-        for layer in range(model.config.num_hidden_layers): 
-            collector = Collector(multiplier=0, head=-1)
-            collectors.append(collector)
-            pv_config.append({
-                "component": f"model.layers[{layer}].self_attn.o_proj.input",
-                "intervention": wrapper(collector),
-            })
+
+    for layer in range(model.config.num_hidden_layers): 
+        collector = Collector(multiplier=0, head=-1)
+        collectors.append(collector)
+        pv_config.append({
+            "component": f"model.layers[{layer}].self_attn.o_proj.input",
+            "intervention": wrapper(collector),
+        })
 
     collected_model = pv.IntervenableModel(pv_config, model)
 
@@ -124,14 +151,17 @@ def main():
     all_head_wise_activations = []
 
     print("Getting activations")
-    for prompt in tqdm(prompts):
-        if "gpt2" in args.model_name:
-            prompt = str(prompt)  # 👈 Add this
-            layer_wise_activations, head_wise_activations, _ = get_gpt2_activations_pyvene(collected_model, collectors, prompt, tokenizer,device)
-        else:
-            layer_wise_activations, head_wise_activations, _ = get_llama_activations_pyvene(collected_model, collectors, prompt, device)
+    print("number of layers", model.config.num_hidden_layers, len(collectors))
+    i = 0
 
-        all_layer_wise_activations.append(layer_wise_activations[:,-1,:].copy())
+
+
+    print("Getting activations")
+    for prompt in tqdm(prompts):
+
+        layer_wise_activations, head_wise_activations, _ = get_llama_activations_pyvene(collected_model, collectors, prompt, device)
+
+        # all_layer_wise_activations.append(layer_wise_activations[:,-1,:].copy())
         all_head_wise_activations.append(head_wise_activations.copy())
 
     print("Saving labels")

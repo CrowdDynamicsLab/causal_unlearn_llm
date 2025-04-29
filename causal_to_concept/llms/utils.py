@@ -208,6 +208,9 @@ def intervention_fn(head_output, layer_name, start_edit_location='lt', prompt_en
     # This is a basic implementation - customize based on your needs
     return head_output
 
+
+
+
 def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verbose=True, device=None, cache_dir=None, interventions={}, intervention_fn=None, instruction_prompt=True, many_shot_prefix=None, use_special_direction=False):
 
     """Stores answers from autoregressive HF models (GPT-2, GPT-Neo)"""
