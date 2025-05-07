@@ -1,0 +1,17 @@
+system_prompt: |
+  Please act as an impartial judge and evaluate the fluency of the sentence completion fragment provided below. Focus solely on fluency, disregarding its completeness, compliance, relevance, coherence with any broader context, or informativeness.
+
+user_prompt: |
+  You will be given the sentence stem (which doesn't need to be evaluated) and the sentence completion fragment which would continue the sentence.
+
+  Begin your evaluation by briefly describing the fluency of the sentence, noting any unnatural phrasing, awkward transitions, grammatical errors, or repetitive structures that may hinder readability. After providing your explanation, rate the sentence's fluency on a scale from 0 to 2, where 0 indicates the sentence is not fluent and highly unnatural (e.g., incomprehensible or repetitive), 1 indicates it is somewhat fluent but contains noticeable errors or awkward phrasing, and 2 indicates the sentence is fluent and almost perfect. 
+
+  Provide your rating using this exact format: "Rating: [[score]]".
+
+  [Sentence Stem Start]
+  {}
+  [Sentence Stem End]
+
+  [Sentence Fragment Start]
+  {}
+  [Sentence Fragment End]
