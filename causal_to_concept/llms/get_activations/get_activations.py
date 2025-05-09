@@ -32,11 +32,8 @@ HF_NAMES = {
     'llama3_8B_instruct': 'meta-llama/Meta-Llama-3-8B-Instruct',
     'llama3_70B': 'meta-llama/Meta-Llama-3-70B',
     'llama3_70B_instruct': 'meta-llama/Meta-Llama-3-70B-Instruct',
-<<<<<<< HEAD
     'vicuna_13b': 'lmsys/vicuna-13b-v1.5',
-=======
     'tiny_gpt2':"sshleifer/tiny-gpt2",
->>>>>>> fd4f7dfddf3d9f9d8a8a6e19f71e2cab31162adb
 }
 
 def main(): 
