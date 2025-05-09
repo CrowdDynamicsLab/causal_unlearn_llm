@@ -49,16 +49,10 @@ from TruthfulQA.truthfulqa.utilities import (
     format_best,
     find_start,
 )
-<<<<<<< HEAD
 from truthfulqa.presets import preset_map, COMPARE_PRIMER
 from truthfulqa.models import find_subsequence, set_columns, MC_calcs
 from truthfulqa.evaluates import format_frame, data_to_dict
 
-=======
-from TruthfulQA.truthfulqa.presets import preset_map, COMPARE_PRIMER
-from TruthfulQA.truthfulqa.models import find_subsequence, set_columns, MC_calcs
-from TruthfulQA.truthfulqa.evaluates import format_frame, data_to_dict
->>>>>>> fd4f7dfddf3d9f9d8a8a6e19f71e2cab31162adb
 
 def load_nq():
     dataset = load_dataset("OamPatel/iti_nq_open_val")["validation"]

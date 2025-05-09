@@ -9,6 +9,7 @@ import numpy as np
 import argparse
 from datasets import load_dataset
 from transformers import LlamaForCausalLM, LlamaTokenizer, AutoTokenizer, GPT2LMHeadModel
+from vae import VAE, vae_loss_function, train_vae, test_vae
 
 # from accelerate import Accelerator
 # accelerator = Accelerator()
@@ -16,7 +17,7 @@ from transformers import LlamaForCausalLM, LlamaTokenizer, AutoTokenizer, GPT2LM
 import sys
 sys.path.append('../')
 from utils_toxic import alt_tqa_evaluate, flattened_idx_to_layer_head, layer_head_to_flattened_idx, get_interventions_dict, get_top_heads, get_separated_activations, get_com_directions, get_activations
-from utils_toxic import get_special_directions, get_matrix_directions
+from utils_toxic import get_special_directions, get_matrix_directions, train_vae_and_extract_mu, get_top_heads_pns
 # import llama
 
 HF_NAMES = {
@@ -33,18 +34,13 @@ HF_NAMES = {
     'llama2_chat_13B': 'meta-llama/Llama-2-13b-chat-hf', 
     'honest_llama2_chat_13B': 'results_dump/llama2_chat_13B_seed_42_top_48_heads_alpha_15', 
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
-<<<<<<< HEAD
     'honest_llama2_chat_70B': 'results_dump/llama2_chat_70B_seed_42_top_48_heads_alpha_15', 
-    'vicuna_13b': 'lmsys/vicuna-13b-v1.5',
-=======
-    'honest_llama2_chat_70B': 'results_dump/llama2_chat_70B_seed_42_top_48_heads_alpha_15',
-    'tiny_gpt2':"sshleifer/tiny-gpt2",
->>>>>>> fd4f7dfddf3d9f9d8a8a6e19f71e2cab31162adb
+    'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
 }
 
 def main(): 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default='llama_7B', choices=HF_NAMES.keys(), help='model name')
+    parser.add_argument("model_name", type=str, default='llama_7B', choices=HF_NAMES.keys(), help='model name')
     parser.add_argument("--model_dir", type=str, default=None, help='local directory with model data')
     parser.add_argument('--use_honest', action='store_true', help='use local editted version of the model', default=False)
     parser.add_argument('--dataset_name', type=str, default='toxigen_vicuna', help='feature bank for training probes')
@@ -60,10 +56,10 @@ def main():
     parser.add_argument('--judge_name', type=str, required=False)
     parser.add_argument('--info_name', type=str, required=False)
     parser.add_argument('--use_special_direction', action='store_true', default=False)
+    parser.add_argument('--use_pns', action='store_true', default=False)
     parser.add_argument('--use_mat_direction', action='store_true', default=False)
     args = parser.parse_args()
-    device_ids = list(map(int, args.device.split(",")))
-    # device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
     # set seeds
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -85,6 +81,7 @@ def main():
     # df.to_csv(f'./TruthfulQA/shuffled_{args.dataset_name}.csv')
     # df.to_json("../../dataset/shuffled_implicitHate.json", orient="records", lines=False)
     # get two folds using numpy
+    # fold_idxs = np.array_split(np.arange(len(df))[:100], args.num_fold)
     fold_idxs = np.array_split(np.arange(len(df)), args.num_fold)
 
 
@@ -117,10 +114,9 @@ def main():
     # load activations 
     if args.dataset_name == "toxigen":
 
-        head_wise_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")[:6]
+        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")[:6]
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
-        labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy")[:6]
-        print("LABELS", labels)
+        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy")[:6]
         with open(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl", "rb") as f:
             categories = pickle.load(f)  # List of target groups, 1 per sentence
         # tuning dataset: no labels used, just to get std of activations along the direction
@@ -130,10 +126,10 @@ def main():
         tuning_labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_labels.npy")[:6]
 
     elif args.dataset_name == "hate":
-        head_wise_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy")
+        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy")
         # head_wise_activations = head_wise_activations[indices]
         # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy", head_wise_activations)
-        labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy")
+        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy")
         # labels = labels[indices]
         # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy", labels)
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
@@ -143,26 +139,38 @@ def main():
 
         # tuning dataset: no labels used, just to get std of activations along the direction
         activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
-        tuning_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy")
+        tuning_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy")
         # tuning_activations = tuning_activations[indices]
         # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy", tuning_activations)
         tuning_activations = rearrange(tuning_activations, 'b l (h d) -> b l h d', h = num_heads)
-        tuning_labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy")
+        tuning_labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy")
         # tuning_labels = tuning_labels[indices]
         # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy", tuning_labels)
 
     elif args.dataset_name == "hate_vicuna" or args.dataset_name == "toxigen_vicuna":
-        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")
+        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy") # [:200]
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
-        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy")
+        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy") # [:200]
         
         activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
-        tuning_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_head_wise.npy")
+        tuning_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_head_wise.npy") # [:200]
         tuning_activations = rearrange(tuning_activations, 'b l (h d) -> b l h d', h = num_heads)
-        tuning_labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_labels.npy")
+        tuning_labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_labels.npy") # [:200]
         
+    n,l,h,d = head_wise_activations.shape
+    input_dim = l * h * d
+    c_path = f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_c_all.pt"
+    if os.path.exists(c_path):
+        print(f"Loading cached c_all from {c_path}")
+        head_wise_c = torch.load(c_path)
+    else:
+        print(f"No cached c_all found. Training VAE and saving to {c_path}")
+        head_wise_c = train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=32, h_dim1=128, h_dim2=64,
+                                batch_size=128, lr=1e-3, vae_epochs=100, dataset_name=args.dataset_name, model_name=args.model_name, device='cuda')
+    
     # separated_head_wise_activations, separated_labels, idxs_to_split_at = get_separated_activations(labels, head_wise_activations, categories[:100], args.dataset_name)
-    separated_head_wise_activations, separated_labels, idxs_to_split_at = get_activations(labels, head_wise_activations, args.dataset_name, args.model_name)
+    separated_head_wise_activations, separated_labels, separated_head_wise_c, idxs_to_split_at = get_activations(labels, head_wise_activations, head_wise_c, args.dataset_name, args.model_name)
+    
     # run k-fold cross validation
     results = []
     for i in range(args.num_fold):
@@ -181,23 +189,18 @@ def main():
         df.iloc[val_set_idxs].to_csv(f"splits/{args.dataset_name}_fold_{i}_val_seed_{args.seed}.csv", index=False)
         df.iloc[test_idxs].to_csv(f"splits/{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv", index=False)
 
-<<<<<<< HEAD
-        # # get directions
-        # if args.use_center_of_mass:
-        #     com_directions = get_com_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
-        # elif args.use_special_direction:
-        #     com_directions = get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, df)
-        # elif args.use_mat_direction:
-        #     com_directions = get_matrix_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
-        # else:
-        #     com_directions = None
-        # print("Finished computing com_directions of shape", com_directions.shape)
-=======
         # get directions
         if args.use_center_of_mass:
             com_directions = get_com_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
         elif args.use_special_direction:
-            com_directions = get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, df)
+            direct_path = f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_special_direction.npy"
+            if os.path.exists(direct_path):
+                print(f"Loading direct from {direct_path}")
+                com_directions = np.load(direct_path)
+            else:
+                print(f"No cached direct found. Saving to {direct_path}")
+                com_directions = get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, df)
+                np.save(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_special_direction.npy", com_directions)
         elif args.use_mat_direction:
             com_directions = get_matrix_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
         else:
@@ -205,12 +208,18 @@ def main():
 
         # breakpoint()
         print("Finished computing com_directions of shape", com_directions.shape)
->>>>>>> fd4f7dfddf3d9f9d8a8a6e19f71e2cab31162adb
 
-        top_heads, probes = get_top_heads(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, num_layers, num_heads, args.seed, args.num_heads, args.use_random_dir)
-        np.save(f'./features/{args.model_name}_{args.dataset_name}_top_heads.npy', top_heads)
+
+        if args.use_pns:
+            top_heads, pns_scores = get_top_heads_pns(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels,
+                        separated_head_wise_c, num_layers, num_heads, num_to_intervene=args.num_heads, lambda_reg=1e-4, sigma_sq=1.0, seed=42, use_random_dir=args.use_random_dir)
+            np.save(f'./features/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_{i}_pns_scores.npy', pns_scores)
+            probes = None
+        else:
+            top_heads, probes = get_top_heads(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, num_layers, num_heads, args.seed, args.num_heads, args.use_random_dir)
+        np.save(f'./features/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_{i}_top_heads.npy', top_heads)
+                
         print("Heads intervened: ", sorted(top_heads))
-
         interventions = get_interventions_dict(top_heads, probes, tuning_activations, num_heads, args.use_center_of_mass, args.use_random_dir, args.use_mat_direction, args.use_special_direction, com_directions)
         print("Finished computing interventions dict")
 
@@ -281,7 +290,7 @@ def main():
             head_output = rearrange(head_output, 'b s h d -> b s (h d)')
             return head_output.type(torch.float16)
 
-        filename = f'{args.model_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{int(args.alpha)}_fold_{i}'
+        filename = f'{args.model_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_{i}'
 
         if args.use_center_of_mass:
             filename += '_com'
@@ -294,6 +303,8 @@ def main():
         if args.use_mat_direction:
             filename += '_mat'
                     
+
+        prefix = "eval_pns_" if args.use_pns else "eval_"
         if args.dataset_name == 'hate':
             input_path = f'splits/shuffled_{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv'
             output_path = f'results_dump/answer_dump/shuffled_{args.dataset_name}_{filename}.csv'
@@ -304,8 +315,8 @@ def main():
             summary_path = f'results_dump/summary_dump/{args.dataset_name}_{filename}.csv'
         elif args.dataset_name == 'toxigen_vicuna' or args.dataset_name == 'hate_vicuna':
             input_path = f'splits/{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv'
-            output_path = f'results_dump/answer_dump/{args.dataset_name}_{filename}.csv'
-            summary_path = f'results_dump/summary_dump/{args.dataset_name}_{filename}.csv'
+            output_path = f'results_dump/answer_dump/{prefix}_answer_{args.dataset_name}_{filename}.csv'
+            summary_path = f'results_dump/summary_dump/{prefix}_summary_{args.dataset_name}_{filename}.csv'
             
         curr_fold_results = alt_tqa_evaluate(
             {args.model_name: model}, 
