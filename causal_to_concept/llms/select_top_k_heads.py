@@ -1,30 +1,33 @@
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
 import numpy as np
-from sklearn.model_selection import train_test_split
-from utils_toxic import get_top_heads, get_separated_activations
 
-# Load
-X = np.load("/projects/bdeb/chenyuen0103/toxic/features/vicuna_13B_toxigen_vicuna_head_wise.npy")  # (samples, layers, heads, dim)
-y = np.load("/projects/bdeb/chenyuen0103/toxic/features/vicuna_13B_toxigen_vicuna_labels.npy")     # (samples,)
-# head_wise_activations = np.rearrange(X, 'b l (h d) -> b l h d', h = 40)
-num_samples, num_layers, num_heads, dim  = X.shape
-# Split into training/validation indices
-train_idx, val_idx = train_test_split(np.arange(num_samples), test_size=0.2, random_state=42)
+model_name = "lmsys/vicuna-13b-v1.5"
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Reshape to mimic `separated_head_wise_activations = [X[i:i+1] for i in range(len(X))]`
-separated_activations = [X[i:i+1] for i in range(len(X))]
-separated_labels = [y[i:i+1] for i in range(len(y))]
+model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map="auto")
+tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-# Get top K heads
-top_heads, trained_probes = get_top_heads(
-    train_idx,
-    val_idx,
-    separated_activations,
-    separated_labels,
-    num_layers=num_layers,
-    num_heads=num_heads,
-    seed=42,
-    num_to_intervene=10,
-    use_random_dir=False
-)
 
-print("Top heads:", top_heads)
+top_k_heads = np.load("./False_vicuna_13B_toxigen_vicuna_seed_2_top_36_heads_alpha_5.0_fold_0_top_heads.npy")
+
+# Freeze all parameters
+for param in model.parameters():
+    param.requires_grad = False
+
+# Unfreeze only the top attention heads
+for (layer_idx, head_idx) in top_k_heads:
+    # Locate the output projection matrix of each head
+    attn_proj = model.model.layers[layer_idx].self_attn.o_proj
+
+    # Unfreeze corresponding head slice
+    head_dim = attn_proj.out_features // model.config.num_attention_heads
+    start = head_idx * head_dim
+    end = (head_idx + 1) * head_dim
+
+    # Enable gradient only on relevant slice of the projection weight
+    attn_proj.weight.requires_grad = True
+    attn_proj.bias.requires_grad = True
+
+    # Optional: mask out gradient outside the selected slice
+    # Could be done using hooks or during optimizer step
