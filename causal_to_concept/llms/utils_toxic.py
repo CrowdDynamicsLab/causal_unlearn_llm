@@ -5,6 +5,7 @@ import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import TensorDataset, DataLoader
 # import llama
 from datasets import load_dataset
 from tqdm import tqdm
@@ -21,6 +22,7 @@ import pickle
 from functools import partial
 from pprint import pprint
 from sentence_transformers import SentenceTransformer
+from vae import VAE, vae_loss_function, train_vae, test_vae
 
 from TruthfulQA.truthfulqa import utilities, models, metrics
 import openai
@@ -67,6 +69,27 @@ def load_triviaqa():
         new_row = pd.DataFrame({"question": [row["question"]], "answer": [[_ for _ in row["answer"]['aliases']]], "false_answer": [row["false_answer"]]})
         df = pd.concat([df, new_row], ignore_index=True)
     return df
+
+def get_mu_from_tensor(vae, data_tensor, batch_size=256, device='cuda'):
+    """
+    Takes a full dataset tensor (or np.array), returns mu for each input using the VAE encoder.
+    """
+    vae.eval()
+    all_mu = []
+
+    # Convert to torch tensor if needed
+    if isinstance(data_tensor, np.ndarray):
+        data_tensor = torch.tensor(data_tensor, dtype=torch.float32)
+
+    data_tensor = data_tensor.to(device)
+
+    with torch.no_grad():
+        for i in range(0, len(data_tensor), batch_size):
+            batch = data_tensor[i:i+batch_size]
+            _, mu, _ = vae(batch)
+            all_mu.append(mu.cpu())
+
+    return torch.cat(all_mu, dim=0)  # [N, z_dim]
 
 def format_truthfulqa(question, choice):
     return f"Q: {question} A: {choice}"
@@ -192,6 +215,96 @@ def load_probes(path):
         probes = pickle.load(f)
     return probes
 
+def get_all_mu(vae, data_tensor, batch_size=256, device='cuda'):
+    """
+    Compute mu for the entire dataset in batches, preserving input order.
+    Inputs:
+        - data_tensor: torch.Tensor or np.ndarray of shape [N, input_dim]
+    Returns:
+        - all_mu: torch.Tensor of shape [N, z_dim]
+    """
+    vae.eval()
+    all_mu = []
+
+    if isinstance(data_tensor, np.ndarray):
+        data_tensor = torch.tensor(data_tensor, dtype=torch.float32)
+    data_tensor = data_tensor.to(device)
+
+    with torch.no_grad():
+        for i in range(0, len(data_tensor), batch_size):
+            batch = data_tensor[i:i+batch_size]
+            _, mu, _ = vae(batch)
+            all_mu.append(mu.cpu())
+
+    return torch.cat(all_mu, dim=0)  # shape: [N, z_dim]
+
+
+def train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=1, h_dim1=128, h_dim2=64,
+                              batch_size=128, lr=1e-3, vae_epochs=20, dataset_name=None, model_name=None, device='cuda'):
+    # Flatten if needed
+    # print(np.array(head_wise_activations).nbytes / 1e9, "GB")
+    split = int(0.8 * len(head_wise_activations))
+    train_raw = head_wise_activations[:split]
+    val_raw = head_wise_activations[split:]
+    all_X_train = torch.tensor(np.array(train_raw), dtype=torch.float32).view(-1, input_dim)
+    all_X_val   = torch.tensor(np.array(val_raw), dtype=torch.float32).view(-1, input_dim)
+    label_train_raw = labels[:split]
+    label_val_raw = labels[split:]
+    y_train = torch.tensor(label_train_raw, dtype=torch.float32)
+    y_val = torch.tensor(label_val_raw, dtype=torch.float32)
+    # Dataloaders
+    train_loader = DataLoader(TensorDataset(all_X_train), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(TensorDataset(all_X_val), batch_size=batch_size, shuffle=False)
+    # Init VAE
+    vae = VAE(input_dim, h_dim1, h_dim2, z_dim).to(device)
+    optimizer = torch.optim.Adam(vae.parameters(), lr=lr)
+
+    # Training loop
+    for epoch in range(vae_epochs):
+        vae.train()
+        total_loss = 0
+        for batch_idx, (data,) in enumerate(train_loader):
+            data = data.to(device)
+            optimizer.zero_grad()
+            recon_batch, mu, log_var = vae(data)
+            # print(data.size(), data[0])
+            #print(recon_batch.size(), recon_batch[0])
+            loss = vae_loss_function(recon_batch, data, mu, log_var)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {epoch+1}/{vae_epochs}, Avg Train Loss: {total_loss / len(train_loader.dataset):.4f}")
+
+        # Optional: evaluate on val set
+        vae.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for (data,) in val_loader:
+                data = data.to(device)
+                recon_batch, mu, log_var = vae(data)
+                val_loss += vae_loss_function(recon_batch, data, mu, log_var).item()
+        print(f"           Avg Val Loss:   {val_loss / len(val_loader.dataset):.4f}")
+
+    # Extract mu vectors (context c_i)
+    train_mu = get_all_mu(vae, all_X_train, batch_size=256, device='cuda')
+    val_mu   = get_all_mu(vae, all_X_val, batch_size=256, device='cuda')
+
+    c_all = torch.cat([train_mu, val_mu], dim=0)  # shape: [N_total, z_dim]
+    acc, f1 = evaluate_latent_mu(train_mu, y_train, val_mu, y_val)
+    print("c_all size", c_all.size())
+    torch.save(c_all, f"/work/hdd/bcxt/yian3/toxic/features/{model_name}_{dataset_name}_c_all.pt")
+    return train_mu, val_mu, c_all
+
+def evaluate_latent_mu(train_mu, y_train, val_mu, y_val, seed=42):
+    clf = LogisticRegression(random_state=seed, max_iter=1000)
+    clf.fit(train_mu.numpy(), y_train)
+    preds = clf.predict(val_mu.numpy())
+
+    acc = accuracy_score(y_val, preds)
+    f1 = f1_score(y_val, preds)
+    print(f"VAE Latent Probe - Val Accuracy: {acc:.4f}, F1 Score: {f1:.4f}")
+    return acc, f1
+
 # -- TruthfulQA helper functions -- # 
 
 def intervention_fn(head_output, layer_name, start_edit_location='lt', prompt_encoding=None):
@@ -262,36 +375,27 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
     # --- intervention code --- #
 
     sequences = []
-    print("START GENERATING ")
     with torch.no_grad():
         for idx, input_ids in enumerate(tqdm(tokens)):
             max_len = input_ids.shape[-1] + 50
-
+            print("IDX", idx)
             # --- intervention code --- #
             with TraceDict(model, layers_to_intervene, edit_output=intervene) as ret: 
                 input_ids = input_ids.to(model.device)
 
                 # model = model.to(torch.float32)
-                model_gen_tokens = model.generate(input_ids, top_k=10, max_length=max_len, num_return_sequences=1,min_new_tokens=20, )[:, input_ids.shape[-1]:]
+                model_gen_tokens = model.generate(input_ids, top_k=10, max_length=max_len, num_return_sequences=1,min_new_tokens=20, do_sample=True)[:, input_ids.shape[-1]:]
 
             model_gen_str = tokenizer.decode(model_gen_tokens[0], skip_special_tokens=True)
             model_gen_str = model_gen_str.strip()
             clean_ids = [t for t in model_gen_tokens[0].tolist() if t != tokenizer.pad_token_id]
             decoded = tokenizer.decode(clean_ids, skip_special_tokens=True)
-            # print("WHAT ARE YOU PRINTING", model_gen_str)
-            # try: 
-            #     # remove everything after 'Q:'
-            #     model_gen_str = model_gen_str.split("Q:")[0].strip()
-            #     # keep everything after A: 
-            #     model_gen_str = model_gen_str.split("A:")[1].strip()
-            # except: 
-            #     pass
 
             if verbose: 
                 print("MODEL_OUTPUT: ", model_gen_str)
             
             frame.loc[idx, tag] = model_gen_str
-            if not model_gen_str:
+            if not model_gen_str: 
                 break
             sequences.append(model_gen_str)
 
@@ -555,9 +659,7 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
     """
 
     questions = utilities.load_questions(filename=input_path)
-
     print("ASSUMES OPENAI_API_KEY ENVIRONMENT VARIABLE IS SET")
-    import os
     openai.api_key = os.environ.get('OPENAI_API_KEY')
     
     for mdl in models.keys(): 
@@ -599,7 +701,7 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
                 questions, sequences = tqa_run_answers(questions, ENGINE_MAP[mdl], mdl, preset, model=llama_model, tokenizer=llama_tokenizer,
                                 device=device, cache_dir=cache_dir, verbose=verbose,
                                 interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
-
+            print(len(questions))
             utilities.save_questions(questions, output_path)
 
             if 'mc' in metric_names:
@@ -747,6 +849,66 @@ def get_top_heads(train_idxs, val_idxs, separated_activations, separated_labels,
 
     return top_heads, probes
 
+def get_top_heads_pns(train_idxs, val_idxs, separated_head_wise_activations,  # shape: [N, L, H, D]
+    separated_labels, separated_head_wise_c, num_layers, num_heads, num_to_intervene=10, lambda_reg=1e-4, sigma_sq=1.0, seed=42, use_random_dir=False):
+
+    all_X_train = np.concatenate([separated_head_wise_activations[i] for i in train_idxs], axis = 0)
+    all_X_val = np.concatenate([separated_head_wise_activations[i] for i in val_idxs], axis = 0)
+
+    c_train = torch.stack([x for i in train_idxs for x in separated_head_wise_c[i]])  # shape [2 * len(train_idxs), z_dim]
+    c_val = torch.stack([x for i in val_idxs for x in separated_head_wise_c[i]])
+    y_train = np.concatenate([separated_labels[i] for i in train_idxs], axis = 0)
+    y_val = np.concatenate([separated_labels[i] for i in val_idxs], axis = 0)
+
+    all_X = np.concatenate([all_X_train, all_X_val], axis=0)
+    y_all = np.concatenate([y_train, y_val], axis=0)
+
+    all_X = torch.tensor(all_X, dtype=torch.float32)       # [N_total, L, H, D]
+    y_all = torch.tensor(y_all, dtype=torch.float32).unsqueeze(1)  # [N_total, 1]
+    c_all = torch.cat([c_train, c_val], dim=0)
+
+
+    N, L, H, D = all_X.shape
+    C = c_all.shape[1]
+    logpns_scores = np.zeros((L, H))
+
+    for l in tqdm(range(num_layers)):
+        for h in range(num_heads):
+            X = all_X[:, l, h, :]  # [N, D]
+            y = y_all              # [N, 1]
+            c = c_all              # [N, C]
+
+            # Ridge regression: β = (XᵗX + λI)⁻¹ Xᵗy
+            XTX = X.T @ X
+            XTy = X.T @ y
+            I = torch.eye(X.shape[1], device=X.device)
+            beta = torch.linalg.solve(XTX + lambda_reg * I, XTy)  # [D, 1]
+
+            # Centered X and c
+            X_centered = X - X.mean(dim=0, keepdim=True)  # [N, D]
+            C_centered = c - c.mean(dim=0, keepdim=True)  # [N, C]
+
+            # gamma can be fixed random or learned; here we randomize for now
+            gamma = torch.randn(C, 1, device=X.device)
+
+            # Compute log PNS score
+            term1 = torch.sum((X_centered @ beta) ** 2)
+            term2 = 0 # 2 * torch.sum((X_centered @ beta) * (C_centered @ gamma).squeeze())
+
+            logpns = (1 / (2 * sigma_sq)) * (term1 + term2)
+            logpns_scores[l, h] = logpns.item()
+
+    # Flatten and select top heads
+    flattened_scores = logpns_scores.reshape(-1)
+    if use_random_dir:
+        random_idxs = np.random.choice(num_layers * num_heads, num_layers * num_heads, replace=False)
+        top_heads = [flattened_idx_to_layer_head(idx, num_heads) for idx in random_idxs[:num_to_intervene]]
+    else:
+        top_idxs = np.argsort(flattened_scores)[::-1][:num_to_intervene]
+        top_heads = [flattened_idx_to_layer_head(idx, num_heads) for idx in top_idxs]
+
+    return top_heads, logpns_scores
+
 def get_interventions_dict(top_heads, probes, tuning_activations, num_heads, use_center_of_mass, use_random_dir, use_mat_direction, use_special_direction, com_directions):
     
     interventions = {}
@@ -844,7 +1006,7 @@ def get_separated_activations(labels, head_wise_activations, categories, dataset
 
     return grouped_activations, grouped_labels, idxs_to_split_at
 
-def get_activations(labels, head_wise_activations, dataset, model_name): 
+def get_activations(labels, head_wise_activations, head_wise_c, dataset, model_name): 
     sentences = pd.read_csv(f'./TruthfulQA/{dataset}.csv')
     texts = sentences["text"]
     toxic_texts = sentences["toxic_text"]
@@ -854,12 +1016,14 @@ def get_activations(labels, head_wise_activations, dataset, model_name):
     
     grouped_activations = []
     grouped_labels = []
+    grouped_cs = []
     idxs_to_split_at = []
     used_idxs = set()
     
     for i in range(0, len(labels), 2):
         group_acts = [head_wise_activations[i], head_wise_activations[i+1]]
         group_labels = [labels[i], labels[i+1]]
+        group_cs = [head_wise_c[i], head_wise_c[i+1]]
 
         if sorted(group_labels) != [0, 1]:
             print(f"[Warning] Pair at index {i} doesn't contain both toxic and non-toxic: {group_labels}")
@@ -868,10 +1032,11 @@ def get_activations(labels, head_wise_activations, dataset, model_name):
 
         grouped_activations.append(np.stack(group_acts))  # (2, L, H, D)
         grouped_labels.append(group_labels)
+        grouped_cs.append(group_cs)
         idxs_to_split_at.append(len(grouped_activations) * 2)  # running total
 
 
-    return grouped_activations, grouped_labels, idxs_to_split_at
+    return grouped_activations, grouped_labels, grouped_cs, idxs_to_split_at
 
 def get_com_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels): 
 

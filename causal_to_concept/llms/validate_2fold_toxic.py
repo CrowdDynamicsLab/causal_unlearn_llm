@@ -9,6 +9,7 @@ import numpy as np
 import argparse
 from datasets import load_dataset
 from transformers import LlamaForCausalLM, LlamaTokenizer, AutoTokenizer, GPT2LMHeadModel
+from vae import VAE, vae_loss_function, train_vae, test_vae
 
 # from accelerate import Accelerator
 # accelerator = Accelerator()
@@ -16,7 +17,7 @@ from transformers import LlamaForCausalLM, LlamaTokenizer, AutoTokenizer, GPT2LM
 import sys
 sys.path.append('../')
 from utils_toxic import alt_tqa_evaluate, flattened_idx_to_layer_head, layer_head_to_flattened_idx, get_interventions_dict, get_top_heads, get_separated_activations, get_com_directions, get_activations
-from utils_toxic import get_special_directions, get_matrix_directions
+from utils_toxic import get_special_directions, get_matrix_directions, train_vae_and_extract_mu, get_top_heads_pns
 # import llama
 
 HF_NAMES = {
@@ -55,6 +56,7 @@ def main():
     parser.add_argument('--judge_name', type=str, required=False)
     parser.add_argument('--info_name', type=str, required=False)
     parser.add_argument('--use_special_direction', action='store_true', default=False)
+    parser.add_argument('--use_pns', action='store_true', default=False)
     parser.add_argument('--use_mat_direction', action='store_true', default=False)
     args = parser.parse_args()
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
@@ -155,8 +157,20 @@ def main():
         tuning_activations = rearrange(tuning_activations, 'b l (h d) -> b l h d', h = num_heads)
         tuning_labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_labels.npy") # [:200]
         
+    n,l,h,d = head_wise_activations.shape
+    input_dim = l * h * d
+    c_path = f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_c_all.pt"
+    if os.path.exists(c_path):
+        print(f"Loading cached c_all from {c_path}")
+        head_wise_c = torch.load(c_path)
+    else:
+        print(f"No cached c_all found. Training VAE and saving to {c_path}")
+        head_wise_c = train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=32, h_dim1=128, h_dim2=64,
+                                batch_size=128, lr=1e-3, vae_epochs=100, dataset_name=args.dataset_name, model_name=args.model_name, device='cuda')
+    
     # separated_head_wise_activations, separated_labels, idxs_to_split_at = get_separated_activations(labels, head_wise_activations, categories[:100], args.dataset_name)
-    separated_head_wise_activations, separated_labels, idxs_to_split_at = get_activations(labels, head_wise_activations, args.dataset_name, args.model_name)
+    separated_head_wise_activations, separated_labels, separated_head_wise_c, idxs_to_split_at = get_activations(labels, head_wise_activations, head_wise_c, args.dataset_name, args.model_name)
+    
     # run k-fold cross validation
     results = []
     for i in range(args.num_fold):
@@ -179,7 +193,14 @@ def main():
         if args.use_center_of_mass:
             com_directions = get_com_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
         elif args.use_special_direction:
-            com_directions = get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, df)
+            direct_path = f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_special_direction.npy"
+            if os.path.exists(direct_path):
+                print(f"Loading direct from {direct_path}")
+                com_directions = np.load(direct_path)
+            else:
+                print(f"No cached direct found. Saving to {direct_path}")
+                com_directions = get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, df)
+                np.save(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_special_direction.npy", com_directions)
         elif args.use_mat_direction:
             com_directions = get_matrix_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
         else:
@@ -188,10 +209,17 @@ def main():
         # breakpoint()
         print("Finished computing com_directions of shape", com_directions.shape)
 
-        top_heads, probes = get_top_heads(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, num_layers, num_heads, args.seed, args.num_heads, args.use_random_dir)
-        np.save(f'./features/{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_{i}_top_heads.npy', top_heads)
-        print("Heads intervened: ", sorted(top_heads))
 
+        if args.use_pns:
+            top_heads, pns_scores = get_top_heads_pns(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels,
+                        separated_head_wise_c, num_layers, num_heads, num_to_intervene=args.num_heads, lambda_reg=1e-4, sigma_sq=1.0, seed=42, use_random_dir=args.use_random_dir)
+            np.save(f'./features/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_{i}_pns_scores.npy', pns_scores)
+            probes = None
+        else:
+            top_heads, probes = get_top_heads(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, num_layers, num_heads, args.seed, args.num_heads, args.use_random_dir)
+        np.save(f'./features/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_{i}_top_heads.npy', top_heads)
+                
+        print("Heads intervened: ", sorted(top_heads))
         interventions = get_interventions_dict(top_heads, probes, tuning_activations, num_heads, args.use_center_of_mass, args.use_random_dir, args.use_mat_direction, args.use_special_direction, com_directions)
         print("Finished computing interventions dict")
 
@@ -275,6 +303,8 @@ def main():
         if args.use_mat_direction:
             filename += '_mat'
                     
+
+        prefix = "eval_pns_" if args.use_pns else "eval_"
         if args.dataset_name == 'hate':
             input_path = f'splits/shuffled_{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv'
             output_path = f'results_dump/answer_dump/shuffled_{args.dataset_name}_{filename}.csv'
@@ -285,8 +315,8 @@ def main():
             summary_path = f'results_dump/summary_dump/{args.dataset_name}_{filename}.csv'
         elif args.dataset_name == 'toxigen_vicuna' or args.dataset_name == 'hate_vicuna':
             input_path = f'splits/{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv'
-            output_path = f'results_dump/answer_dump/{args.dataset_name}_{filename}.csv'
-            summary_path = f'results_dump/summary_dump/{args.dataset_name}_{filename}.csv'
+            output_path = f'results_dump/answer_dump/{prefix}_answer_{args.dataset_name}_{filename}.csv'
+            summary_path = f'results_dump/summary_dump/{prefix}_summary_{args.dataset_name}_{filename}.csv'
             
         curr_fold_results = alt_tqa_evaluate(
             {args.model_name: model}, 
