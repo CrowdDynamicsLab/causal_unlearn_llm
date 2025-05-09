@@ -36,7 +36,8 @@ HF_NAMES = {
     'mistral-7b': "mistralai/Mistral-7B-v0.3",
     'mistral-7b-instruct': "mistralai/Mistral-7B-Instruct-v0.3",
     'gemma-2-9b': "google/gemma-2-9b",
-    'gemma-2-9b-instruct':"google/gemma-2-9b-it"
+    'gemma-2-9b-instruct':"google/gemma-2-9b-it",
+    'vicuna_13b': 'lmsys/vicuna-13b-v1.5',
 }
 
 def main(): 
