@@ -87,25 +87,19 @@ def setup_model(model_str):
         'llama2-7b-chat': "meta-llama/Llama-2-7b-chat-hf",
         'llama2-7b-instruct': "togethercomputer/Llama-2-7B-32K-Instruct",
         'llama2-13b': "meta-llama/Llama-2-13b-hf",  # base (useful for unaligned generation)
-        
         'mistral-7b': "mistralai/Mistral-7B-v0.3",
         'mistral-7b-instruct': "mistralai/Mistral-7B-Instruct-v0.3",
         'mistral-7b-v0.1': "mistralai/Mistral-7B-v0.1",  # base version (unaligned)
-
         'alpaca-7b': "allenai/open-instruct-stanford-alpaca-7b",
-
         'gemma-7b': "google/gemma-7b",
         'gemma-7b-instruct': "google/gemma-7b-it",
         'gemma-2-9b': "google/gemma-2-9b",
         'gemma-2-9b-instruct': "google/gemma-2-9b-it",
-
         'vicuna-13b': "TheBloke/Wizard-Vicuna-13B-Uncensored-GPTQ",
         'wizardlm-13b': "TheBloke/WizardLM-13B-V1.0-GPTQ",  # added uncensored WizardLM
-
         'gpt-j-6b': "EleutherAI/gpt-j-6B",
         'pythia-12b': "EleutherAI/pythia-12b",
         'falcon-rw-1b': "tiiuae/falcon-rw-1b",  # Small unaligned Falcon
-
         'llama4-scout-17b': "meta-llama/Llama-4-Scout-17B-16E",
         'llama4-scout-17b-instruct': "meta-llama/Llama-4-Scout-17B-16E-Instruct",
         'llama4-maverick-17B-128E': "meta-llama/Llama-4-Maverick-17B-128E",
