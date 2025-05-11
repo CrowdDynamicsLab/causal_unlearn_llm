@@ -5,6 +5,7 @@ import sys
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import TensorDataset, DataLoader
 # import llama
 from datasets import load_dataset
 from tqdm import tqdm
@@ -21,6 +22,7 @@ import pickle
 from functools import partial
 from pprint import pprint
 from sentence_transformers import SentenceTransformer
+from vae import VAE, vae_loss_function, train_vae, test_vae
 
 from TruthfulQA.truthfulqa import utilities, models, metrics
 import openai
@@ -36,9 +38,8 @@ ENGINE_MAP = {
     'vicuna_7B': 'AlekseyKorshuk/vicuna-7b', 
     'llama2_chat_7B': 'meta-llama/Llama-2-7b-chat-hf', 
     'llama2_chat_13B': 'meta-llama/Llama-2-13b-chat-hf', 
-    'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf',
-    'llama3_8B': 'meta-llama/Meta-Llama-3-8B',
-    'llama3_8B_instruct': 'meta-llama/Meta-Llama-3-8B-Instruct',
+    'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
+    'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
 }
 
 from TruthfulQA.truthfulqa.utilities import (
@@ -68,6 +69,27 @@ def load_triviaqa():
         new_row = pd.DataFrame({"question": [row["question"]], "answer": [[_ for _ in row["answer"]['aliases']]], "false_answer": [row["false_answer"]]})
         df = pd.concat([df, new_row], ignore_index=True)
     return df
+
+def get_mu_from_tensor(vae, data_tensor, batch_size=256, device='cuda'):
+    """
+    Takes a full dataset tensor (or np.array), returns mu for each input using the VAE encoder.
+    """
+    vae.eval()
+    all_mu = []
+
+    # Convert to torch tensor if needed
+    if isinstance(data_tensor, np.ndarray):
+        data_tensor = torch.tensor(data_tensor, dtype=torch.float32)
+
+    data_tensor = data_tensor.to(device)
+
+    with torch.no_grad():
+        for i in range(0, len(data_tensor), batch_size):
+            batch = data_tensor[i:i+batch_size]
+            _, mu, _ = vae(batch)
+            all_mu.append(mu.cpu())
+
+    return torch.cat(all_mu, dim=0)  # [N, z_dim]
 
 def format_truthfulqa(question, choice):
     return f"Q: {question} A: {choice}"
@@ -193,6 +215,96 @@ def load_probes(path):
         probes = pickle.load(f)
     return probes
 
+def get_all_mu(vae, data_tensor, batch_size=256, device='cuda'):
+    """
+    Compute mu for the entire dataset in batches, preserving input order.
+    Inputs:
+        - data_tensor: torch.Tensor or np.ndarray of shape [N, input_dim]
+    Returns:
+        - all_mu: torch.Tensor of shape [N, z_dim]
+    """
+    vae.eval()
+    all_mu = []
+
+    if isinstance(data_tensor, np.ndarray):
+        data_tensor = torch.tensor(data_tensor, dtype=torch.float32)
+    data_tensor = data_tensor.to(device)
+
+    with torch.no_grad():
+        for i in range(0, len(data_tensor), batch_size):
+            batch = data_tensor[i:i+batch_size]
+            _, mu, _ = vae(batch)
+            all_mu.append(mu.cpu())
+
+    return torch.cat(all_mu, dim=0)  # shape: [N, z_dim]
+
+
+def train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=1, h_dim1=128, h_dim2=64,
+                              batch_size=128, lr=1e-3, vae_epochs=20, dataset_name=None, model_name=None, device='cuda'):
+    # Flatten if needed
+    # print(np.array(head_wise_activations).nbytes / 1e9, "GB")
+    split = int(0.8 * len(head_wise_activations))
+    train_raw = head_wise_activations[:split]
+    val_raw = head_wise_activations[split:]
+    all_X_train = torch.tensor(np.array(train_raw), dtype=torch.float32).view(-1, input_dim)
+    all_X_val   = torch.tensor(np.array(val_raw), dtype=torch.float32).view(-1, input_dim)
+    label_train_raw = labels[:split]
+    label_val_raw = labels[split:]
+    y_train = torch.tensor(label_train_raw, dtype=torch.float32)
+    y_val = torch.tensor(label_val_raw, dtype=torch.float32)
+    # Dataloaders
+    train_loader = DataLoader(TensorDataset(all_X_train), batch_size=batch_size, shuffle=True)
+    val_loader = DataLoader(TensorDataset(all_X_val), batch_size=batch_size, shuffle=False)
+    # Init VAE
+    vae = VAE(input_dim, h_dim1, h_dim2, z_dim).to(device)
+    optimizer = torch.optim.Adam(vae.parameters(), lr=lr)
+
+    # Training loop
+    for epoch in range(vae_epochs):
+        vae.train()
+        total_loss = 0
+        for batch_idx, (data,) in enumerate(train_loader):
+            data = data.to(device)
+            optimizer.zero_grad()
+            recon_batch, mu, log_var = vae(data)
+            # print(data.size(), data[0])
+            #print(recon_batch.size(), recon_batch[0])
+            loss = vae_loss_function(recon_batch, data, mu, log_var)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        print(f"Epoch {epoch+1}/{vae_epochs}, Avg Train Loss: {total_loss / len(train_loader.dataset):.4f}")
+
+        # Optional: evaluate on val set
+        vae.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for (data,) in val_loader:
+                data = data.to(device)
+                recon_batch, mu, log_var = vae(data)
+                val_loss += vae_loss_function(recon_batch, data, mu, log_var).item()
+        print(f"           Avg Val Loss:   {val_loss / len(val_loader.dataset):.4f}")
+
+    # Extract mu vectors (context c_i)
+    train_mu = get_all_mu(vae, all_X_train, batch_size=256, device='cuda')
+    val_mu   = get_all_mu(vae, all_X_val, batch_size=256, device='cuda')
+
+    c_all = torch.cat([train_mu, val_mu], dim=0)  # shape: [N_total, z_dim]
+    acc, f1 = evaluate_latent_mu(train_mu, y_train, val_mu, y_val)
+    print("c_all size", c_all.size())
+    torch.save(c_all, f"/work/hdd/bcxt/yian3/toxic/features/{model_name}_{dataset_name}_c_all.pt")
+    return train_mu, val_mu, c_all
+
+def evaluate_latent_mu(train_mu, y_train, val_mu, y_val, seed=42):
+    clf = LogisticRegression(random_state=seed, max_iter=1000)
+    clf.fit(train_mu.numpy(), y_train)
+    preds = clf.predict(val_mu.numpy())
+
+    acc = accuracy_score(y_val, preds)
+    f1 = f1_score(y_val, preds)
+    print(f"VAE Latent Probe - Val Accuracy: {acc:.4f}, F1 Score: {f1:.4f}")
+    return acc, f1
+
 # -- TruthfulQA helper functions -- # 
 
 def intervention_fn(head_output, layer_name, start_edit_location='lt', prompt_encoding=None):
@@ -213,10 +325,9 @@ def intervention_fn(head_output, layer_name, start_edit_location='lt', prompt_en
                 device=device, cache_dir=cache_dir, verbose=verbose,
                 interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
 """
-def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verbose=True, device=None, cache_dir=None, interventions={}, intervention_fn=None, instruction_prompt=True, many_shot_prefix=None, use_special_direction=False, output_path=None):
+def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verbose=True, device=None, cache_dir=None, interventions={}, intervention_fn=None, instruction_prompt=True, many_shot_prefix=None, use_special_direction=False):
 
     """Stores answers from autoregressive HF models (GPT-2, GPT-Neo)"""
-
     if tag not in frame.columns:
         frame[tag] = ''
 
@@ -226,7 +337,7 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
     # get tokens for ending sequence
     # seq_start = np.array(tokenizer('A:')['input_ids'])
     # seq_end = np.array(tokenizer('Q:')['input_ids'])
-
+    print("total questions", len(frame))
     tokens = []
     for idx in frame.index: 
         if pd.isnull(frame.loc[idx, tag]) or not len(frame.loc[idx, tag]):
@@ -237,26 +348,25 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
                 prompt_encoding = None
             prefix = ''
             if instruction_prompt:  # from Ouyang et al. (2022) Figure 17, followed by LLaMA evaluation, and then followed by us
-                prefix += 'Please rewrite the following sentence so that it has similar meaning but is not toxic:' # + '\n\n'
+                # prefix += 'Please rewrite the following sentence so that it is not toxic has similar meaning but is not toxic:' # + '\n\n'
+                # prefix += f"""Paraphrase the following sentence in a polite and completely non-toxic way and don't generate any irrelevant contents:
+                
+                # Original text: "{prompt}"
+                
+                # Paraphrase: """ 
+                prefix += f"""Please continue the following sentence: "{prompt}" """
             if many_shot_prefix is not None:
                 prefix += many_shot_prefix + '\n\n'
-            prompt = prefix + prompt  
+            prompt = prefix # + prompt  
             input_ids = tokenizer(prompt, return_tensors='pt').input_ids
             tokens.append(input_ids)
-
-
-
-
-            # explicitly set pad_token_id if missing
-            model.config.pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-
-            tokens.append(input_ids)
+    
 
     # --- intervention code --- #
     def id(head_output, layer_name): 
         return head_output
 
-    if interventions == {} or intervention_fn is None:
+    if interventions == {}: 
         intervene = id
         layers_to_intervene = []
     else: 
@@ -265,57 +375,29 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
     # --- intervention code --- #
 
     sequences = []
-
     with torch.no_grad():
         for idx, input_ids in enumerate(tqdm(tokens)):
             max_len = input_ids.shape[-1] + 50
-
+            print("IDX", idx)
             # --- intervention code --- #
             with TraceDict(model, layers_to_intervene, edit_output=intervene) as ret: 
                 input_ids = input_ids.to(model.device)
 
                 # model = model.to(torch.float32)
-                # model_gen_tokens = model.generate(input_ids, top_k=10, max_length=max_len, num_return_sequences=1,min_new_tokens=10, )[:, input_ids.shape[-1]:]
-                try:
-                    model_gen_tokens = model.generate(
-                        input_ids,
-                        # attention_mask=attention_mask,
-                        # pad_token_id=pad_token_id,
-                        top_k=10,
-                        max_length=max_len,
-                        num_return_sequences=1,
-                        min_new_tokens=10,
-                    )[:, input_ids.shape[-1]:]
-                except Exception as e:
-                    print(f"Error generating tokens for index {idx}: {e}")
-                    breakpoint()
-                    continue
+                model_gen_tokens = model.generate(input_ids, top_k=10, max_length=max_len, num_return_sequences=1,min_new_tokens=20, do_sample=True)[:, input_ids.shape[-1]:]
+
             model_gen_str = tokenizer.decode(model_gen_tokens[0], skip_special_tokens=True)
             model_gen_str = model_gen_str.strip()
             clean_ids = [t for t in model_gen_tokens[0].tolist() if t != tokenizer.pad_token_id]
             decoded = tokenizer.decode(clean_ids, skip_special_tokens=True)
-            print("WHAT ARE YOU PRINTING", model_gen_str)
-            # try: 
-            #     # remove everything after 'Q:'
-            #     model_gen_str = model_gen_str.split("Q:")[0].strip()
-            #     # keep everything after A: 
-            #     model_gen_str = model_gen_str.split("A:")[1].strip()
-            # except: 
-            #     pass
 
             if verbose: 
                 print("MODEL_OUTPUT: ", model_gen_str)
             
             frame.loc[idx, tag] = model_gen_str
-            if not model_gen_str:
+            if not model_gen_str: 
                 break
             sequences.append(model_gen_str)
-            if idx % 100 == 0:
-                print("Saving intermediate results...")
-                utilities.save_questions(frame, output_path)
-                if device:
-                    torch.cuda.empty_cache()
-                # break
 
             # --- intervention code --- #
 
@@ -335,9 +417,6 @@ def tqa_run_probs(frame, engine, tag, preset, model=None, tokenizer=None, verbos
         model.eval()
     if tokenizer is None:
         tokenizer = AutoTokenizer.from_pretrained(engine, cache_dir=cache_dir)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
 
     with torch.no_grad():
         for idx in tqdm(frame.index):
@@ -580,9 +659,7 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
     """
 
     questions = utilities.load_questions(filename=input_path)
-
     print("ASSUMES OPENAI_API_KEY ENVIRONMENT VARIABLE IS SET")
-    import os
     openai.api_key = os.environ.get('OPENAI_API_KEY')
     
     for mdl in models.keys(): 
@@ -609,31 +686,27 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
             except Exception as err:
                 print(err)
 
-
         # llama
-        # if mdl in ['llama_1B', 'llama_3B', 'llama_7B', 'alpaca_7B', 'vicuna_7B', 'llama2_chat_7B', 'llama2_chat_13B', 'llama2_chat_70B']: 
-        assert models[mdl] is not None, 'must provide llama model'
-        llama_model = models[mdl]
-        if mdl == 'llama_1B' or mdl == 'llama_3B':
-            llama_tokenizer = AutoTokenizer.from_pretrained(ENGINE_MAP[mdl], load_in_8bit=True,)
-        else:
-            # llama_tokenizer = LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
-            llama_tokenizer = AutoTokenizer.from_pretrained(ENGINE_MAP[mdl], load_in_8bit=True,)
-        # llama_tokenizer = llama.LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
-        if llama_tokenizer.pad_token is None:
-            llama_tokenizer.pad_token = llama_tokenizer.eos_token
+        if mdl in ['llama_1B', 'llama_3B', 'llama_7B', 'alpaca_7B', 'vicuna_13B', 'llama2_chat_7B', 'llama2_chat_13B', 'llama2_chat_70B']: 
 
-        
-        if 'judge' in metric_names or 'info' in metric_names: 
-            questions, sequences = tqa_run_answers(questions, ENGINE_MAP[mdl], mdl, preset, model=llama_model, tokenizer=llama_tokenizer,
-                            device=device, cache_dir=cache_dir, verbose=verbose,
-                            interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction, output_path=output_path)
-
-        utilities.save_questions(questions, output_path)
-
-        if 'mc' in metric_names:
-            questions = tqa_run_probs(questions, ENGINE_MAP[mdl], mdl, model=llama_model, tokenizer=llama_tokenizer, preset=preset, device=device, cache_dir=cache_dir, verbose=False, interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
+            assert models[mdl] is not None, 'must provide llama model'
+            llama_model = models[mdl]
+            if mdl == 'llama_1B' or mdl == 'llama_3B' or mdl == 'vicuna_13B':
+                llama_tokenizer = AutoTokenizer.from_pretrained(ENGINE_MAP[mdl], load_in_8bit=True,)
+            else:
+                llama_tokenizer = LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
+            # llama_tokenizer = llama.LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
+            
+            if 'judge' in metric_names or 'info' in metric_names: 
+                questions, sequences = tqa_run_answers(questions, ENGINE_MAP[mdl], mdl, preset, model=llama_model, tokenizer=llama_tokenizer,
+                                device=device, cache_dir=cache_dir, verbose=verbose,
+                                interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
+            print(len(questions))
             utilities.save_questions(questions, output_path)
+
+            if 'mc' in metric_names:
+                questions = tqa_run_probs(questions, ENGINE_MAP[mdl], mdl, model=llama_model, tokenizer=llama_tokenizer, preset=preset, device=device, cache_dir=cache_dir, verbose=False, interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
+                utilities.save_questions(questions, output_path)
         
         # gpt-neo
         if mdl in ['neo-small', 'neo-med', 'neo-large']:
@@ -693,7 +766,7 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
     # save all
     utilities.save_questions(questions, output_path)
 
-    # format and print basic results
+    # # format and print basic results
     results = format_frame(questions)
     results = results.mean(axis=0)
     results = results.reset_index().rename(columns={'level_0': 'Model',
@@ -725,6 +798,7 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
         results.loc[model_key, 'KL wrt Orig'] = kl_wrt_orig
 
     # save results
+    print("SAVING...", summary_path)
     results.to_csv(summary_path, index=False)
     
     return results
@@ -744,7 +818,7 @@ def train_probes(seed, train_set_idxs, val_set_idxs, separated_head_wise_activat
     all_X_val = np.concatenate([separated_head_wise_activations[i] for i in val_set_idxs], axis = 0)
     y_train = np.concatenate([separated_labels[i] for i in train_set_idxs], axis = 0)
     y_val = np.concatenate([separated_labels[i] for i in val_set_idxs], axis = 0)
-    #print("==========SLICE=========", all_X_train.shape)
+    # print("==========SLICE=========", all_X_train.shape)
     for layer in tqdm(range(num_layers)): 
         for head in range(num_heads): 
             X_train = all_X_train[:,layer,head,:]
@@ -766,7 +840,6 @@ def get_top_heads(train_idxs, val_idxs, separated_activations, separated_labels,
     all_head_accs_np = all_head_accs_np.reshape(num_layers, num_heads)
 
     top_heads = []
-
     top_accs = np.argsort(all_head_accs_np.reshape(num_heads*num_layers))[::-1][:num_to_intervene]
     top_heads = [flattened_idx_to_layer_head(idx, num_heads) for idx in top_accs]
     if use_random_dir: 
@@ -775,178 +848,6 @@ def get_top_heads(train_idxs, val_idxs, separated_activations, separated_labels,
         top_heads = [flattened_idx_to_layer_head(idx, num_heads) for idx in random_idxs[:num_to_intervene]]
 
     return top_heads, probes
-
-def get_interventions_dict(top_heads, probes, tuning_activations, num_heads, use_center_of_mass, use_random_dir, use_mat_direction, use_special_direction, com_directions):
-    
-    interventions = {}
-    for layer, head in top_heads: 
-        interventions[f"model.layers.{layer}.self_attn.o_proj"] = []
-
-    for layer, head in top_heads:
-        activations = tuning_activations[:,layer,head,:] # batch x 128
-        if use_mat_direction or use_special_direction:
-            # print("batch activations shape", activations.shape) # batch x 128
-            # print("com_directions shape", com_directions.shape) # 1024 x 128 x 128
-            direction = com_directions[layer_head_to_flattened_idx(layer, head, num_heads)] # 128 x 128
-            # print("mat_direction shape", direction.shape) # 128 x 128
-
-            proj_val_std = None
-            # proj_vals = activations @ direction.T # batch x 128
-            # proj_val_std = np.std(proj_vals, axis=0).reshape(1, -1) # 1 x 128
-            # print("proj_val_std", proj_val_std.shape, np.max(proj_val_std), np.min(proj_val_std))
-            interventions[f"model.layers.{layer}.self_attn.o_proj"].append((head, direction, proj_val_std))
-        else:
-            if use_center_of_mass: 
-                direction = com_directions[layer_head_to_flattened_idx(layer, head, num_heads)]
-            elif use_random_dir: 
-                direction = np.random.normal(size=(128,))
-            else: 
-                direction = probes[layer_head_to_flattened_idx(layer, head, num_heads)].coef_
-            direction = direction / np.linalg.norm(direction)
-            proj_vals = activations @ direction.T
-            proj_val_std = np.std(proj_vals)
-            interventions[f"model.layers.{layer}.self_attn.o_proj"].append((head, direction.squeeze(), proj_val_std))
-
-    for layer, head in top_heads: 
-        interventions[f"model.layers.{layer}.self_attn.o_proj"] = sorted(interventions[f"model.layers.{layer}.self_attn.o_proj"], key = lambda x: x[0])
-
-    return interventions
-
-def get_separated_activations(labels, head_wise_activations, categories, dataset): 
-    if dataset == "toxigen":
-        dataset = load_dataset("json", data_files="../../dataset/toxiGen.json")["train"]
-    elif dataset == "hate":
-        dataset = load_dataset("json", data_files="../../dataset/shuffled_implicitHate.json")["train"]
-
-    actual_labels = []
-    label_map = {
-        "hate": 1,
-        "neutral": 0
-    }
-    for i in range(len(dataset))[:100]:
-        actual_label = dataset[i]['label']
-        if actual_label == 0 or actual_label == 1:
-            actual_labels.append(actual_label)
-        else:
-            actual_labels.append(label_map.get(actual_label.lower(), 0))
-    categories = [set(c) for c in categories]
-    grouped_activations = []
-    grouped_labels = []
-    idxs_to_split_at = []
-    used_idxs = set()
-    # breakpoint()
-    for i in range(len(actual_labels)):
-        # if i in used_idxs:
-        #     continue
-        base_cat = categories[i]
-        base_label = labels[i]
-        base_activation = head_wise_activations[i]
-
-        # Start building the group
-        group_acts = [base_activation]
-        group_labels = [base_label]
-        label_counts = {0:0, 1:0}
-
-        for j in range(len(labels)):
-            if j == i: 
-                continue
-            if label_counts[0] >= 2 and label_counts[1] >= 2:
-                continue
-            if categories[j] & base_cat:  # intersection check
-                group_acts.append(head_wise_activations[j])
-                group_labels.append(labels[j])
-                label_counts[labels[j]] += 1
-            if len(group_labels) == 5 and label_counts[0] >= 2 and label_counts[1] >= 2:
-                break
-            if len(set(group_labels)) == 1 and len(group_labels)==5:
-                if group_labels[-1] == 0:
-                    group_labels[-1] = 1
-                if group_labels[-1] == 1:
-                    group_labels[-1] = 0
-            
-            
-        # if len(group_acts) == 5:
-        grouped_activations.append(np.stack(group_acts))  # (5, L, H, D)
-        grouped_labels.append(group_labels)
-        idxs_to_split_at.append(len(grouped_activations) * 5)  # running total
-
-
-    return grouped_activations, grouped_labels, idxs_to_split_at
-
-def get_com_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels): 
-
-    com_directions = []
-
-    for layer in range(num_layers): 
-        for head in range(num_heads): 
-            usable_idxs = np.concatenate([train_set_idxs, val_set_idxs], axis=0)
-            usable_head_wise_activations = np.concatenate([separated_head_wise_activations[i][:,layer,head,:] for i in usable_idxs], axis=0)
-            usable_labels = np.concatenate([separated_labels[i] for i in usable_idxs], axis=0)
-            true_mass_mean = np.mean(usable_head_wise_activations[usable_labels == 1], axis=0)
-            false_mass_mean = np.mean(usable_head_wise_activations[usable_labels == 0], axis=0)
-            com_directions.append(true_mass_mean - false_mass_mean)
-    com_directions = np.array(com_directions)
-
-    return com_directions
-
-def get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, df): 
-    usable_idxs = np.concatenate([train_set_idxs, val_set_idxs], axis=0)
-    usable_labels = [separated_labels[i] for i in usable_idxs]
-    all_prompt_encodings = [sentence_embedding.encode(df.loc[idx, 'text']) for idx in usable_idxs]
-    
-    sp_directions = []
-    for layer in tqdm(range(num_layers)): 
-        for head in range(num_heads):
-            direction = None
-            for i in range(len(usable_idxs)):
-                idx = usable_idxs[i]
-                cur_usable_labels = np.array(usable_labels[i])
-                usable_head_wise_activations = separated_head_wise_activations[idx][:, layer, head, :]
-                nontox_mass_mean = np.mean(usable_head_wise_activations[cur_usable_labels == 0], axis=0)
-                toxic_mass_mean = np.mean(usable_head_wise_activations[cur_usable_labels == 1], axis=0)
-                prompt_encoding = all_prompt_encodings[i]
-                if direction is None: 
-                    direction = np.outer(nontox_mass_mean - toxic_mass_mean, prompt_encoding)
-                else:
-                    direction += np.outer(nontox_mass_mean - toxic_mass_mean, prompt_encoding)
-                delta = nontox_mass_mean - toxic_mass_mean
-                if np.isnan(delta).any():
-                    print("layer, head, i:", layer, head, i, cur_usable_labels)
-                    break
-            direction = direction / np.linalg.norm(direction, axis=1).reshape(-1, 1)
-            # print("direction", direction.shape)
-            sp_directions.append(direction)
-    sp_directions = np.array(sp_directions)
-    if np.isnan(sp_directions).any() or np.isinf(sp_directions).any():
-        print(f"[SKIP] NaN direction in layer {layer} head {head}")
-        direction = np.zeros_like(direction)
-    return sp_directions
-
-def get_matrix_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels): 
-    usable_idxs = np.concatenate([train_set_idxs, val_set_idxs], axis=0)
-    usable_labels = [separated_labels[i] for i in usable_idxs]
-
-    mat_directions = []
-    for layer in tqdm(range(num_layers)): 
-        for head in range(num_heads):
-            direction = None
-            for i in range(len(usable_idxs)):
-                idx = usable_idxs[i]
-                cur_usable_labels = np.array(usable_labels[i])
-                usable_head_wise_activations = separated_head_wise_activations[idx][:, layer, head, :]
-                true_mass_mean = np.mean(usable_head_wise_activations[cur_usable_labels == 1], axis=0)
-                false_mass_mean = np.mean(usable_head_wise_activations[cur_usable_labels == 0], axis=0)
-                # print("overflow check", np.max(np.abs(np.outer(true_mass_mean - false_mass_mean, false_mass_mean))))
-                if direction is None: 
-                    direction = np.outer(true_mass_mean - false_mass_mean, false_mass_mean)
-                else:
-                    direction += np.outer(true_mass_mean - false_mass_mean, false_mass_mean)
-            direction = direction / (np.linalg.norm(direction, axis=1).reshape(-1, 1) + 1e-6)
-            mat_directions.append(direction)
-    mat_directions = np.array(mat_directions)
-    return mat_directions
-
-
 
 def get_top_heads_pns(train_idxs, val_idxs, separated_head_wise_activations,  # shape: [N, L, H, D]
     separated_labels, separated_head_wise_c, num_layers, num_heads, num_to_intervene=10, lambda_reg=1e-4, sigma_sq=1.0, seed=42, use_random_dir=False):
@@ -1008,3 +909,206 @@ def get_top_heads_pns(train_idxs, val_idxs, separated_head_wise_activations,  # 
 
     return top_heads, logpns_scores
 
+def get_interventions_dict(top_heads, probes, tuning_activations, num_heads, use_center_of_mass, use_random_dir, use_mat_direction, use_special_direction, com_directions):
+    
+    interventions = {}
+    for layer, head in top_heads: 
+        interventions[f"model.layers.{layer}.self_attn.o_proj"] = []
+
+    for layer, head in top_heads:
+        activations = tuning_activations[:,layer,head,:] # batch x 128
+        if use_mat_direction or use_special_direction:
+            # print("batch activations shape", activations.shape) # batch x 128
+            # print("com_directions shape", com_directions.shape) # 1024 x 128 x 128
+            direction = com_directions[layer_head_to_flattened_idx(layer, head, num_heads)] # 128 x 128
+            # print("mat_direction shape", direction.shape) # 128 x 128
+
+            proj_val_std = None
+            # proj_vals = activations @ direction.T # batch x 128
+            # proj_val_std = np.std(proj_vals, axis=0).reshape(1, -1) # 1 x 128
+            # print("proj_val_std", proj_val_std.shape, np.max(proj_val_std), np.min(proj_val_std))
+            interventions[f"model.layers.{layer}.self_attn.o_proj"].append((head, direction, proj_val_std))
+        else:
+            if use_center_of_mass: 
+                direction = com_directions[layer_head_to_flattened_idx(layer, head, num_heads)]
+            elif use_random_dir: 
+                direction = np.random.normal(size=(128,))
+            else: 
+                direction = probes[layer_head_to_flattened_idx(layer, head, num_heads)].coef_
+            direction = direction / np.linalg.norm(direction)
+            proj_vals = activations @ direction.T
+            proj_val_std = np.std(proj_vals)
+            interventions[f"model.layers.{layer}.self_attn.o_proj"].append((head, direction.squeeze(), proj_val_std))
+
+    for layer, head in top_heads: 
+        interventions[f"model.layers.{layer}.self_attn.o_proj"] = sorted(interventions[f"model.layers.{layer}.self_attn.o_proj"], key = lambda x: x[0])
+
+    return interventions
+
+def get_separated_activations(labels, head_wise_activations, categories, dataset): 
+    if dataset == "toxigen":
+        dataset = load_dataset("json", data_files="../../dataset/toxiGen.json")["train"]
+    elif dataset == "hate":
+        dataset = load_dataset("json", data_files="../../dataset/shuffled_implicitHate.json")["train"]
+
+    actual_labels = []
+    label_map = {
+        "hate": 1,
+        "neutral": 0
+    }
+    for i in range(len(dataset)):
+        actual_label = dataset[i]['label']
+        if actual_label == 0 or actual_label == 1:
+            actual_labels.append(actual_label)
+        else:
+            actual_labels.append(label_map.get(actual_label.lower(), 0))
+    categories = [set(c) for c in categories]
+    grouped_activations = []
+    grouped_labels = []
+    idxs_to_split_at = []
+    used_idxs = set()
+    
+    for i in range(len(actual_labels)):
+        # if i in used_idxs:
+        #     continue
+        base_cat = categories[i]
+        base_label = labels[i]
+        base_activation = head_wise_activations[i]
+
+        # Start building the group
+        group_acts = [base_activation]
+        group_labels = [base_label]
+        label_counts = {0:0, 1:0}
+
+        for j in range(len(labels)):
+            if j == i: 
+                continue
+            if label_counts[0] >= 2 and label_counts[1] >= 2:
+                continue
+            if categories[j] & base_cat:  # intersection check
+                group_acts.append(head_wise_activations[j])
+                group_labels.append(labels[j])
+                label_counts[labels[j]] += 1
+            if len(group_labels) == 5 and label_counts[0] >= 2 and label_counts[1] >= 2:
+                break
+            if len(set(group_labels)) == 1 and len(group_labels)==5:
+                if group_labels[-1] == 0:
+                    group_labels[-1] = 1
+                if group_labels[-1] == 1:
+                    group_labels[-1] = 0
+            
+            
+        # if len(group_acts) == 5:
+        grouped_activations.append(np.stack(group_acts))  # (5, L, H, D)
+        grouped_labels.append(group_labels)
+        idxs_to_split_at.append(len(grouped_activations) * 5)  # running total
+
+
+    return grouped_activations, grouped_labels, idxs_to_split_at
+
+def get_activations(labels, head_wise_activations, head_wise_c, dataset, model_name): 
+    sentences = pd.read_csv(f'./TruthfulQA/{dataset}.csv')
+    texts = sentences["text"]
+    toxic_texts = sentences["toxic_text"]
+    non_toxic_texts = sentences["non_toxic_text"]
+    
+    print("SHAPES", len(labels), len(head_wise_activations), len(texts))
+    
+    grouped_activations = []
+    grouped_labels = []
+    grouped_cs = []
+    idxs_to_split_at = []
+    used_idxs = set()
+    
+    for i in range(0, len(labels), 2):
+        group_acts = [head_wise_activations[i], head_wise_activations[i+1]]
+        group_labels = [labels[i], labels[i+1]]
+        group_cs = [head_wise_c[i], head_wise_c[i+1]]
+
+        if sorted(group_labels) != [0, 1]:
+            print(f"[Warning] Pair at index {i} doesn't contain both toxic and non-toxic: {group_labels}")
+            continue
+            
+
+        grouped_activations.append(np.stack(group_acts))  # (2, L, H, D)
+        grouped_labels.append(group_labels)
+        grouped_cs.append(group_cs)
+        idxs_to_split_at.append(len(grouped_activations) * 2)  # running total
+
+
+    return grouped_activations, grouped_labels, grouped_cs, idxs_to_split_at
+
+def get_com_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels): 
+
+    com_directions = []
+
+    for layer in range(num_layers): 
+        for head in range(num_heads): 
+            usable_idxs = np.concatenate([train_set_idxs, val_set_idxs], axis=0)
+            usable_head_wise_activations = np.concatenate([separated_head_wise_activations[i][:,layer,head,:] for i in usable_idxs], axis=0)
+            usable_labels = np.concatenate([separated_labels[i] for i in usable_idxs], axis=0)
+            true_mass_mean = np.mean(usable_head_wise_activations[usable_labels == 1], axis=0)
+            false_mass_mean = np.mean(usable_head_wise_activations[usable_labels == 0], axis=0)
+            com_directions.append(true_mass_mean - false_mass_mean)
+    com_directions = np.array(com_directions)
+
+
+    return com_directions
+
+def get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, df): 
+    usable_idxs = np.concatenate([train_set_idxs, val_set_idxs], axis=0)
+    usable_labels = [separated_labels[i] for i in usable_idxs]
+    all_prompt_encodings = [sentence_embedding.encode(df.loc[idx, 'text']) for idx in usable_idxs]
+    
+    sp_directions = []
+    for layer in tqdm(range(num_layers)): 
+        for head in range(num_heads):
+            direction = None
+            for i in range(len(usable_idxs)):
+                idx = usable_idxs[i]
+                cur_usable_labels = np.array(usable_labels[i])
+                usable_head_wise_activations = separated_head_wise_activations[idx][:, layer, head, :]
+                nontox_mass_mean = np.mean(usable_head_wise_activations[cur_usable_labels == 0], axis=0)
+                toxic_mass_mean = np.mean(usable_head_wise_activations[cur_usable_labels == 1], axis=0)
+                prompt_encoding = all_prompt_encodings[i]
+                if direction is None: 
+                    direction = np.outer(nontox_mass_mean - toxic_mass_mean, prompt_encoding)
+                else:
+                    direction += np.outer(nontox_mass_mean - toxic_mass_mean, prompt_encoding)
+                delta = nontox_mass_mean - toxic_mass_mean
+                if np.isnan(delta).any():
+                    print("layer, head, i:", layer, head, i, cur_usable_labels)
+                    break
+            direction = direction / np.linalg.norm(direction, axis=1).reshape(-1, 1)
+            # print("direction", direction.shape)
+            sp_directions.append(direction)
+    sp_directions = np.array(sp_directions)
+    #np.save("directions.npy", my_array)
+    if np.isnan(sp_directions).any() or np.isinf(sp_directions).any():
+        print(f"[SKIP] NaN direction in layer {layer} head {head}")
+        direction = np.zeros_like(direction)
+    return sp_directions
+
+def get_matrix_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels): 
+    usable_idxs = np.concatenate([train_set_idxs, val_set_idxs], axis=0)
+    usable_labels = [separated_labels[i] for i in usable_idxs]
+
+    mat_directions = []
+    for layer in tqdm(range(num_layers)): 
+        for head in range(num_heads):
+            direction = None
+            for i in range(len(usable_idxs)):
+                idx = usable_idxs[i]
+                cur_usable_labels = np.array(usable_labels[i])
+                usable_head_wise_activations = separated_head_wise_activations[idx][:, layer, head, :]
+                true_mass_mean = np.mean(usable_head_wise_activations[cur_usable_labels == 0], axis=0)
+                false_mass_mean = np.mean(usable_head_wise_activations[cur_usable_labels == 1], axis=0)
+                # print("overflow check", np.max(np.abs(np.outer(true_mass_mean - false_mass_mean, false_mass_mean))))
+                if direction is None: 
+                    direction = np.outer(true_mass_mean - false_mass_mean, false_mass_mean)
+                else:
+                    direction += np.outer(true_mass_mean - false_mass_mean, false_mass_mean)
+            direction = direction / (np.linalg.norm(direction, axis=1).reshape(-1, 1) + 1e-6)
+            mat_directions.append(direction)
+    mat_directions = np.array(mat_directions)
+    return mat_directions

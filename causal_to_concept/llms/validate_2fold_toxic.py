@@ -15,7 +15,7 @@ from vae import VAE, vae_loss_function, train_vae, test_vae
 # accelerator = Accelerator()
 
 import sys
-sys.path.append('../')
+# sys.path.append('../')
 from utils_toxic import alt_tqa_evaluate, flattened_idx_to_layer_head, layer_head_to_flattened_idx, get_interventions_dict, get_top_heads, get_separated_activations, get_com_directions, get_activations
 from utils_toxic import get_special_directions, get_matrix_directions, train_vae_and_extract_mu, get_top_heads_pns
 # import llama
@@ -36,6 +36,7 @@ HF_NAMES = {
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
     'honest_llama2_chat_70B': 'results_dump/llama2_chat_70B_seed_42_top_48_heads_alpha_15', 
     'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
+    'llama3_8B': 'meta-llama/Llama-3.2-8B',
 }
 
 def main(): 
