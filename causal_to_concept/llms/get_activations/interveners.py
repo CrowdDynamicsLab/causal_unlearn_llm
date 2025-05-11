@@ -40,7 +40,8 @@ class Collector:
 
     def __call__(self, b, s):
         # Shape: (batch_size=1, seq_len, hidden_dim)
-        final_token = b[0, -1].detach().clone()
+        # final_token = b[0, -1].detach().clone()
+        final_token = b[0, -1]
 
         if self.head == -1 or self.num_heads is None:
             self.states.append(final_token)

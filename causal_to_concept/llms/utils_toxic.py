@@ -945,3 +945,66 @@ def get_matrix_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, s
             mat_directions.append(direction)
     mat_directions = np.array(mat_directions)
     return mat_directions
+
+
+
+def get_top_heads_pns(train_idxs, val_idxs, separated_head_wise_activations,  # shape: [N, L, H, D]
+    separated_labels, separated_head_wise_c, num_layers, num_heads, num_to_intervene=10, lambda_reg=1e-4, sigma_sq=1.0, seed=42, use_random_dir=False):
+
+    all_X_train = np.concatenate([separated_head_wise_activations[i] for i in train_idxs], axis = 0)
+    all_X_val = np.concatenate([separated_head_wise_activations[i] for i in val_idxs], axis = 0)
+
+    c_train = torch.stack([x for i in train_idxs for x in separated_head_wise_c[i]])  # shape [2 * len(train_idxs), z_dim]
+    c_val = torch.stack([x for i in val_idxs for x in separated_head_wise_c[i]])
+    y_train = np.concatenate([separated_labels[i] for i in train_idxs], axis = 0)
+    y_val = np.concatenate([separated_labels[i] for i in val_idxs], axis = 0)
+
+    all_X = np.concatenate([all_X_train, all_X_val], axis=0)
+    y_all = np.concatenate([y_train, y_val], axis=0)
+
+    all_X = torch.tensor(all_X, dtype=torch.float32)       # [N_total, L, H, D]
+    y_all = torch.tensor(y_all, dtype=torch.float32).unsqueeze(1)  # [N_total, 1]
+    c_all = torch.cat([c_train, c_val], dim=0)
+
+
+    N, L, H, D = all_X.shape
+    C = c_all.shape[1]
+    logpns_scores = np.zeros((L, H))
+
+    for l in tqdm(range(num_layers)):
+        for h in range(num_heads):
+            X = all_X[:, l, h, :]  # [N, D]
+            y = y_all              # [N, 1]
+            c = c_all              # [N, C]
+
+            # Ridge regression: β = (XᵗX + λI)⁻¹ Xᵗy
+            XTX = X.T @ X
+            XTy = X.T @ y
+            I = torch.eye(X.shape[1], device=X.device)
+            beta = torch.linalg.solve(XTX + lambda_reg * I, XTy)  # [D, 1]
+
+            # Centered X and c
+            X_centered = X - X.mean(dim=0, keepdim=True)  # [N, D]
+            C_centered = c - c.mean(dim=0, keepdim=True)  # [N, C]
+
+            # gamma can be fixed random or learned; here we randomize for now
+            gamma = torch.randn(C, 1, device=X.device)
+
+            # Compute log PNS score
+            term1 = torch.sum((X_centered @ beta) ** 2)
+            term2 = 0 # 2 * torch.sum((X_centered @ beta) * (C_centered @ gamma).squeeze())
+
+            logpns = (1 / (2 * sigma_sq)) * (term1 + term2)
+            logpns_scores[l, h] = logpns.item()
+
+    # Flatten and select top heads
+    flattened_scores = logpns_scores.reshape(-1)
+    if use_random_dir:
+        random_idxs = np.random.choice(num_layers * num_heads, num_layers * num_heads, replace=False)
+        top_heads = [flattened_idx_to_layer_head(idx, num_heads) for idx in random_idxs[:num_to_intervene]]
+    else:
+        top_idxs = np.argsort(flattened_scores)[::-1][:num_to_intervene]
+        top_heads = [flattened_idx_to_layer_head(idx, num_heads) for idx in top_idxs]
+
+    return top_heads, logpns_scores
+
