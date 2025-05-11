@@ -36,6 +36,7 @@ HF_NAMES = {
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
     'honest_llama2_chat_70B': 'results_dump/llama2_chat_70B_seed_42_top_48_heads_alpha_15', 
     'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
+    'llama3_8B': 'meta-llama/Meta-Llama-3-8B',
 }
 
 def main(): 
@@ -90,16 +91,10 @@ def main():
     MODEL = model_name if not args.model_dir else args.model_dir
 
     if "gpt2" in args.model_name:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL)
         model = GPT2LMHeadModel.from_pretrained(
             MODEL, low_cpu_mem_usage=True, torch_dtype=torch.float16, device_map="auto"
         )
     else:
-
-        if args.model_name == 'llama_1B' or args.model_name == 'llama_3B':
-            tokenizer = AutoTokenizer.from_pretrained(MODEL)
-        else:
-            tokenizer = LlamaTokenizer.from_pretrained(MODEL)
         model = LlamaForCausalLM.from_pretrained(MODEL, low_cpu_mem_usage = True, torch_dtype=torch.float16, device_map="auto")
     
     
@@ -114,10 +109,10 @@ def main():
     # load activations 
     if args.dataset_name == "toxigen":
 
-        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")[:6]
+        head_wise_activations = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy")[:6]
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
-        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy")[:6]
-        with open(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl", "rb") as f:
+        labels = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy")[:6]
+        with open(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl", "rb") as f:
             categories = pickle.load(f)  # List of target groups, 1 per sentence
         # tuning dataset: no labels used, just to get std of activations along the direction
         activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
@@ -126,40 +121,40 @@ def main():
         tuning_labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_labels.npy")[:6]
 
     elif args.dataset_name == "hate":
-        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy")
+        head_wise_activations = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy")
         # head_wise_activations = head_wise_activations[indices]
         # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy", head_wise_activations)
-        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy")
+        labels = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy")
         # labels = labels[indices]
         # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy", labels)
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
-        with open(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl", "rb") as f:
+        with open(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl", "rb") as f:
             categories = pickle.load(f)  # List of target groups, 1 per sentence
 
 
         # tuning dataset: no labels used, just to get std of activations along the direction
         activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
-        tuning_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy")
+        tuning_activations = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy")
         # tuning_activations = tuning_activations[indices]
         # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy", tuning_activations)
         tuning_activations = rearrange(tuning_activations, 'b l (h d) -> b l h d', h = num_heads)
-        tuning_labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy")
+        tuning_labels = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy")
         # tuning_labels = tuning_labels[indices]
         # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy", tuning_labels)
 
     elif args.dataset_name == "hate_vicuna" or args.dataset_name == "toxigen_vicuna":
-        head_wise_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy") # [:200]
+        head_wise_activations = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy") # [:200]
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
-        labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy") # [:200]
+        labels = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy") # [:200]
         
         activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
-        tuning_activations = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_head_wise.npy") # [:200]
+        tuning_activations = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_head_wise.npy") # [:200]
         tuning_activations = rearrange(tuning_activations, 'b l (h d) -> b l h d', h = num_heads)
-        tuning_labels = np.load(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_labels.npy") # [:200]
+        tuning_labels = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_labels.npy") # [:200]
         
     n,l,h,d = head_wise_activations.shape
     input_dim = l * h * d
-    c_path = f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_c_all.pt"
+    c_path = f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_c_all.pt"
     if os.path.exists(c_path):
         print(f"Loading cached c_all from {c_path}")
         head_wise_c = torch.load(c_path)
@@ -193,14 +188,14 @@ def main():
         if args.use_center_of_mass:
             com_directions = get_com_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
         elif args.use_special_direction:
-            direct_path = f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_special_direction.npy"
+            direct_path = f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_special_direction.npy"
             if os.path.exists(direct_path):
                 print(f"Loading direct from {direct_path}")
                 com_directions = np.load(direct_path)
             else:
                 print(f"No cached direct found. Saving to {direct_path}")
                 com_directions = get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, df)
-                np.save(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{activations_dataset}_special_direction.npy", com_directions)
+                np.save(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_special_direction.npy", com_directions)
         elif args.use_mat_direction:
             com_directions = get_matrix_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
         else:

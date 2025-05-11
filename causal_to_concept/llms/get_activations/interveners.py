@@ -28,7 +28,7 @@ class Collector:
     collect_state = True
     collect_action = False
 
-    def __init__(self, multiplier, head, num_heads=None):
+    def __init__(self, head, num_heads=None):
         self.head = head
         self.num_heads = num_heads  # Only needed if you want head-specific slicing
         self.states = []

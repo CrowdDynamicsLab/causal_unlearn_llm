@@ -291,9 +291,9 @@ def get_llama_activations_pyvene(collected_model, collectors, prompt, device):
             head_wise_hidden_states.append(None)
         collector.reset()
     mlp_wise_hidden_states = []
-    print("SHAPES", len(head_wise_hidden_states), len(head_wise_hidden_states[0]))
+    # print("SHAPES", len(head_wise_hidden_states), len(head_wise_hidden_states[0]))
     head_wise_hidden_states = torch.stack([torch.tensor(h) for h in head_wise_hidden_states], dim=0).squeeze().numpy()
-    print("SHAPES", head_wise_hidden_states.shape)
+    # print("SHAPES", head_wise_hidden_states.shape)
     return hidden_states, head_wise_hidden_states, mlp_wise_hidden_states
 
 def get_llama_logits(model, prompt, device): 
