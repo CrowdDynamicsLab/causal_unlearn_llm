@@ -16,7 +16,7 @@ model_name = "meta-llama/Meta-Llama-3-8B"
 C = torch.load("/projects/bdeb/chenyuen0103/toxic/features/vicuna_13B_toxigen_vicuna_c_all.pt").to(device)
 
 
-selected_heads = top_k_heads = np.load("./False_vicuna_13B_toxigen_vicuna_seed_2_top_36_heads_alpha_5.0_fold_0_top_heads.npy")
+selected_heads = np.load("./False_vicuna_13B_toxigen_vicuna_seed_2_top_36_heads_alpha_5.0_fold_0_top_heads.npy")
 lambda_reg = 1e-4
 sigma_sq = 1.0
 epochs = 2
@@ -26,7 +26,13 @@ max_length = 64
 
 # --- LOAD MODEL & TOKENIZER ---
 tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map="auto")
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.bfloat16,
+    # device_map="auto", # You might want to manage device mapping carefully if memory is tight
+    low_cpu_mem_usage=True  # Add this argument
+)
+
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
