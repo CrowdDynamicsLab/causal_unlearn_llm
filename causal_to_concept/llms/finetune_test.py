@@ -92,45 +92,96 @@ def evaluate_model(model, dataloader, selected_heads):
 
     all_acts = []
     all_labels = []
+    all_confounds = []
 
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["label"].to(device)
+        indices = batch["index"].to(device)
 
         input_embeds = model.get_input_embeddings()(input_ids)
-        outputs = model(input_embeds=input_embeds, attention_mask=attention_mask)
+        _ = model(input_embeds=input_embeds, attention_mask=attention_mask)
 
         head_acts = []
         for (layer_idx, head_idx) in selected_heads:
             o_proj = model.model.layers[layer_idx].self_attn.o_proj
             o_proj_input = forward_saved_inputs[layer_idx]
             if o_proj_input.ndim == 3:
-                o_proj_input = o_proj_input[:, -1, :]
+                o_proj_input = o_proj_input[:, -1, :]  # take last token
             full_output = o_proj(o_proj_input)
             head_dim = model.config.hidden_size // model.config.num_attention_heads
             start = head_idx * head_dim
             end = (head_idx + 1) * head_dim
             head_acts.append(full_output[:, start:end])
 
-        concat = torch.cat(head_acts, dim=-1)  # [B, K * D_head]
+        concat = torch.stack(head_acts, dim=1)  # [B, K, D_head]
         all_acts.append(concat.cpu())
         all_labels.append(labels.cpu())
+        all_confounds.append(C[indices].cpu())
 
-    X = torch.cat(all_acts).numpy()
-    y = torch.cat(all_labels).numpy()
+    # Stack all batches
+    X_tensor = torch.cat(all_acts, dim=0).to(device)               # [N, K, D_head]
+    Y = torch.cat(all_labels, dim=0).to(device)                    # [N]
+    C_tensor = torch.cat(all_confounds, dim=0).to(device)          # [N, D_c]
 
-    # Train a quick linear classifier on eval set
+    B, K, D = X_tensor.shape
+
+    # --- Centered versions ---
+    if B > 1:
+        Xc = X_tensor - X_tensor.mean(0, keepdim=True)
+        Cc = C_tensor - C_tensor.mean(0, keepdim=True)
+    else:
+        Xc = X_tensor
+        Cc = C_tensor
+
+    Y_signed = 2 * Y - 1
+    Y_signed = Y_signed.view(-1)
+
+    # --- beta: head -> Y ---
+    XtX = torch.einsum("bkd,bke->kde", Xc, Xc)
+    XtY = torch.einsum("bkd,b->kd", Xc, Y_signed).unsqueeze(2)
+    I = torch.eye(D, device=device).expand(K, -1, -1)
+    A = (XtX + lambda_reg * I).to(torch.float32)
+    B_ = XtY.to(torch.float32)
+    beta = torch.linalg.solve(A, B_).to(Xc.dtype)
+
+    # --- gamma: confounder -> Y ---
+    CtC = torch.einsum("bd,be->de", Cc, Cc)
+    CtY = torch.einsum("bd,b->d", Cc, Y_signed).unsqueeze(1)
+    I2 = torch.eye(Cc.shape[1], device=device)
+    A2 = (CtC + lambda_reg * I2).to(torch.float32)
+    B2 = CtY.to(torch.float32)
+    gamma = torch.linalg.solve(A2, B2).to(Cc.dtype)
+
+    # --- projection and adjustment ---
+    proj = torch.einsum("bkd,kdl->bkl", Xc, beta).squeeze(-1)  # [B, K]
+    conf = torch.matmul(Cc, gamma).squeeze(-1)
+    conf_adj = proj * conf.unsqueeze(1)
+
+    term1 = (proj**2).sum(0)
+    term2 = 2 * conf_adj.sum(0)
+    logpns_score = (term1 + term2).sum() / (2 * sigma_sq)
+
+    # --- Classifier for accuracy/F1/AUC ---
+    X_flat = X_tensor.view(B, -1).cpu().numpy()
+    y_flat = Y.cpu().numpy()
+
     clf = LogisticRegression(max_iter=1000)
-    clf.fit(X, y)
+    clf.fit(X_flat, y_flat)
+    preds = clf.predict(X_flat)
+    probs = clf.predict_proba(X_flat)[:, 1]
 
-    preds = clf.predict(X)
-    probs = clf.predict_proba(X)[:, 1]
+    acc = accuracy_score(y_flat, preds)
+    f1 = f1_score(y_flat, preds)
+    auc = roc_auc_score(y_flat, probs)
 
-    print("✅ Evaluation (on held-out Theta subset):")
-    print(f"Accuracy: {accuracy_score(y, preds):.4f} | "
-          f"F1: {f1_score(y, preds):.4f} | "
-          f"AUC: {roc_auc_score(y, probs):.4f}")
+    print("\n✅ Evaluation on held-out set:")
+    print(f"logPNS Score: {logpns_score.item():.4f}")
+    print(f"Accuracy:     {acc:.4f}")
+    print(f"F1 Score:     {f1:.4f}")
+    print(f"ROC AUC:      {auc:.4f}")
+
 
 
 forward_saved_inputs = {}
@@ -324,8 +375,8 @@ for epoch in range(epochs):
             accumulated_samples = 0  # reset counter
 
             # Optional: Eval after N steps
-            if step % 100 == 0:
-                evaluate_model(model, eval_oader, selected_heads)
+            if step % 2 == 0:
+                evaluate_model(model, eval_loader, selected_heads)
     progress_bar.close()
     
 
