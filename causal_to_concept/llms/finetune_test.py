@@ -101,7 +101,7 @@ def evaluate_model(model, dataloader, selected_heads):
         indices = batch["index"].to(device)
 
         input_embeds = model.get_input_embeddings()(input_ids)
-        _ = model(input_embeds=input_embeds, attention_mask=attention_mask)
+        _ = model(inputs_embeds=input_embeds, attention_mask=attention_mask)
 
         head_acts = []
         for (layer_idx, head_idx) in selected_heads:
@@ -128,19 +128,18 @@ def evaluate_model(model, dataloader, selected_heads):
     B, K, D = X_tensor.shape
 
     # --- Centered versions ---
-    if B > 1:
-        Xc = X_tensor - X_tensor.mean(0, keepdim=True)
-        Cc = C_tensor - C_tensor.mean(0, keepdim=True)
-    else:
-        Xc = X_tensor
-        Cc = C_tensor
-
-    Y_signed = 2 * Y - 1
+    Xc = head_tensor - head_tensor.mean(0, keepdim=True) if head_tensor.shape[0] > 1 else head_tensor
+    Cc = c_batch - c_batch.mean(0, keepdim=True) if c_batch.shape[0] > 1 else c_batch
+    Y_signed = 2 * labels - 1
     Y_signed = Y_signed.view(-1)
 
-    # --- beta: head -> Y ---
-    XtX = torch.einsum("bkd,bke->kde", Xc, Xc)
-    XtY = torch.einsum("bkd,b->kd", Xc, Y_signed).unsqueeze(2)
+    # Cast to float32 before einsum
+    Xc_f = Xc.to(torch.float32)
+    Y_signed_f = Y_signed.to(torch.float32)
+
+    XtX = torch.einsum("bkd,bke->kde", Xc_f, Xc_f)
+    XtY = torch.einsum("bkd,b->kd", Xc_f, Y_signed_f).unsqueeze(2)
+
     I = torch.eye(D, device=device).expand(K, -1, -1)
     A = (XtX + lambda_reg * I).to(torch.float32)
     B_ = XtY.to(torch.float32)
