@@ -8,15 +8,19 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
 import numpy as np
+from torch.cuda.amp import autocast
+
 
 # --- CONFIG ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model_name = "meta-llama/Meta-Llama-3-8B"
-# model_name = "lmsys/vicuna-13b-v1.5"
+# model_name = "meta-llama/Meta-Llama-3-8B"
+model_name = "lmsys/vicuna-13b-v1.5"
+# model_name = "gpt2"
 C = torch.load("/projects/bdeb/chenyuen0103/toxic/features/vicuna_13B_toxigen_vicuna_c_all.pt").to(device)
 
 
 selected_heads = np.load("./False_vicuna_13B_toxigen_vicuna_seed_2_top_36_heads_alpha_5.0_fold_0_top_heads.npy")
+selected_heads = selected_heads[:10]
 lambda_reg = 1e-4
 sigma_sq = 1.0
 epochs = 2
@@ -25,22 +29,26 @@ lr = 1e-4
 max_length = 64
 
 # --- LOAD MODEL & TOKENIZER ---
-tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(
     model_name,
-    torch_dtype=torch.bfloat16,
-    # device_map="auto", # You might want to manage device mapping carefully if memory is tight
-    low_cpu_mem_usage=True  # Add this argument
-)
+    torch_dtype=torch.float16,
+    low_cpu_mem_usage=True,
+).to(device)
+model.gradient_checkpointing_enable()
 
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
 
-model.eval()
 
 # --- FREEZE & UNFREEZE SELECTED HEADS ---
 params_to_update = []
 head_dim = model.config.hidden_size // model.config.num_attention_heads
+
+
+for param in model.parameters():
+    param.requires_grad = False
+
 
 for layer_idx, head_idx in selected_heads:
     o_proj = model.model.layers[layer_idx].self_attn.o_proj
@@ -60,8 +68,6 @@ optimizer = torch.optim.Adam(params_to_update, lr=lr)
 collected_outputs = {}
 
 
-
-
 @torch.no_grad()
 def evaluate_model(model, dataloader, selected_heads):
     model.eval()
@@ -74,7 +80,7 @@ def evaluate_model(model, dataloader, selected_heads):
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        label = batch["label"].item()
+        label = batch["label"].to(device)
 
         _ = model(input_ids=input_ids, attention_mask=attention_mask)
 
@@ -110,15 +116,20 @@ def evaluate_model(model, dataloader, selected_heads):
 
 def make_hook(layer_idx, head_idx):
     def hook_fn(module, input, output):
-        B, T, D = output.shape
+        head_dim = output.shape[-1] // model.config.num_attention_heads
         start = head_idx * head_dim
         end = (head_idx + 1) * head_dim
-        collected_outputs[(layer_idx, head_idx)] = output[:, -1, start:end]  # last token's head output
+        collected_outputs[(layer_idx, head_idx)] = output[:, -1, start:end]  # [B, D_head]
+        print(f"[Hook] Layer {layer_idx}, Head {head_idx}, Output Shape: {output[:, -1, start:end].shape}")
     return hook_fn
 
-for layer_idx, head_idx in selected_heads:
+# Register per (layer, head)
+for (layer_idx, head_idx) in selected_heads:
     o_proj = model.model.layers[layer_idx].self_attn.o_proj
     o_proj.register_forward_hook(make_hook(layer_idx, head_idx))
+
+
+
 
 # --- DATASET PREP ---
 class ToxicDataset(Dataset):
@@ -165,56 +176,84 @@ for epoch in tqdm(range(epochs), desc="Epochs"):
         attention_mask = batch['attention_mask'].to(device)
         labels = batch['label'].to(device).unsqueeze(1)
         batch_size_actual = input_ids.size(0)
+        with autocast(dtype=torch.float16):  # Ensures grad compatibility with fp16
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
 
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            # --- Collect only selected heads ---
+            head_acts = []
+            for (layer_idx, head_idx) in selected_heads:
+                key = (layer_idx, head_idx)
+                if key not in collected_outputs:
+                    raise RuntimeError(f"Missing collected output for {key}. Hook likely not triggered.")
+                head_acts.append(collected_outputs[key])
 
-        # Get activations for selected heads
-        head_acts = [collected_outputs[(l, h)] for (l, h) in selected_heads]
-        head_tensor = torch.stack(head_acts, dim=1)  # [B, K, D_head]
-        B, K, D = head_tensor.shape
+            head_tensor = torch.stack(head_acts, dim=1)  # [B, K, D_head]
+            B, K, D = head_tensor.shape
 
-        # Get confounder vectors C for the batch
-        indices = batch["index"].to(device)  # shape [B]
-        c_batch = C[indices]                 # shape [B, D_c]
+            # --- Confounders ---
+            indices = batch["index"].to(device)
+            c_batch = C[indices]
 
+            if B > 1:
+                Xc = head_tensor - head_tensor.mean(0, keepdim=True)
+                Cc = c_batch - c_batch.mean(0, keepdim=True)
+            else:
+                Xc = head_tensor
+                Cc = c_batch
 
-        # Centered versions
-        Xc = head_tensor - head_tensor.mean(0, keepdim=True)   # [B, K, D]
-        Cc = c_batch - c_batch.mean(0, keepdim=True)           # [B, D_c]
-        Y = labels.view(-1)                              # [B, 1]
+            Y = 2 * labels - 1
+            Y = Y.view(-1)
 
-        # --- beta: from head_tensor to Y ---
-        XtX = torch.einsum("bkd,bke->kde", Xc, Xc)
-        # breakpoint()
-        XtY = torch.einsum("bkd,b->kd", Xc, Y).unsqueeze(2)  # Result: [K, D]
-  # shape becomes [B, 1, 1]
-        I = torch.eye(D, device=device).expand(K, -1, -1)
-        A = (XtX + lambda_reg * I).to(torch.float32)
-        B_ = XtY.to(torch.float32)
-        beta = torch.linalg.solve(A, B_).to(Xc.dtype)          # [K, D, 1]
+            # --- beta: head -> Y ---
+            XtX = torch.einsum("bkd,bke->kde", Xc, Xc)
+            XtY = torch.einsum("bkd,b->kd", Xc, Y).unsqueeze(2)
+            I = torch.eye(D, device=device).expand(K, -1, -1)
+            A = (XtX + lambda_reg * I).to(torch.float32)
+            B_ = XtY.to(torch.float32)
+            beta = torch.linalg.solve(A, B_).to(Xc.dtype)
 
-        # --- gamma: from confounder C to Y ---
-        CtC = torch.einsum("bd,be->de", Cc, Cc)
-        # breakpoint()
-        CtY = torch.einsum("bd,bl->dl", Cc, Y.unsqueeze(1))
-        I2 = torch.eye(Cc.shape[1], device=device)
-        gamma = torch.linalg.solve(CtC + lambda_reg * I2, CtY).to(Cc.dtype)  # [D_c, 1]
+            # --- gamma: confounder -> Y ---
+            CtC = torch.einsum("bd,be->de", Cc, Cc)
+            CtY = torch.einsum("bd,bl->dl", Cc, Y.unsqueeze(1))
+            I2 = torch.eye(Cc.shape[1], device=device)
+            gamma = torch.linalg.solve(CtC + lambda_reg * I2, CtY).to(Cc.dtype)
 
-        # --- projection and confounder adjustment ---
-        proj = torch.einsum("bkd,kdl->bkl", Xc, beta).squeeze(-1)            # [B, K]
-        conf = torch.matmul(Cc, gamma).squeeze(-1)                          # [B]
-        conf_adj = proj * conf.unsqueeze(1)                                 # [B, K]
+            # --- projections ---
+            proj = torch.einsum("bkd,kdl->bkl", Xc, beta).squeeze(-1)  # [B, K]
+            conf = torch.matmul(Cc, gamma).squeeze(-1)
+            conf_adj = proj * conf.unsqueeze(1)
 
-        term1 = (proj**2).sum(0)                                            # [K]
-        term2 = 2 * conf_adj.sum(0)                                         # [K]
+            term1 = (proj**2).sum(0)
+            term2 = 2 * conf_adj.sum(0)
+            logpns = (term1 + term2) / (2 * sigma_sq)
 
-        logpns = (term1 + term2) / (2 * sigma_sq)
-        loss = -logpns.sum()
+            loss = -logpns.sum()
+
+        assert loss.requires_grad, "Loss doesn't require grad, check dtype or computation path"
         loss.backward()
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if param.requires_grad == False and param.grad is not None:
+                    assert torch.all(param.grad == 0)
+
+
         accumulated_samples += batch_size_actual
 
         # Do optimizer step after reaching virtual batch
         if accumulated_samples >= virtual_batch_size:
+            with torch.no_grad():
+                for (layer_idx, head_idx) in selected_heads:
+                    o_proj = model.model.layers[layer_idx].self_attn.o_proj
+                    head_dim = model.config.hidden_size // model.config.num_attention_heads
+
+                    for i in range(model.config.num_attention_heads):
+                        if i == head_idx:
+                            continue
+                        start = i * head_dim
+                        end = (i + 1) * head_dim
+                        o_proj.weight.grad[:, start:end].zero_()
+                        if o_proj.bias is not None:
+                            o_proj.bias.grad[start:end].zero_()
             optimizer.step()
             optimizer.zero_grad()
             step += 1
@@ -228,4 +267,4 @@ for epoch in tqdm(range(epochs), desc="Epochs"):
     print(f"Loss: {loss.item():.4f}")
     
 
-print("\n✅ LLaMA-3 log-PNS fine-tuning complete.")
+print(f"\n✅ {model_name} log-PNS fine-tuning complete.")

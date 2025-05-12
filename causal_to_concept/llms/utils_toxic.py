@@ -885,8 +885,12 @@ def get_top_heads_pns(train_idxs, val_idxs, separated_head_wise_activations,  # 
             beta = torch.linalg.solve(XTX + lambda_reg * I, XTy)  # [D, 1]
 
             # Centered X and c
-            X_centered = X - X.mean(dim=0, keepdim=True)  # [N, D]
-            C_centered = c - c.mean(dim=0, keepdim=True)  # [N, C]
+            if X.shape[0] > 1:
+                X_centered = X - X.mean(dim=0, keepdim=True)  # [N, D]
+                C_centered = c - c.mean(dim=0, keepdim=True)  # [N, C]
+            else:
+                X_centered = X
+                C_centered = c
 
             # gamma can be fixed random or learned; here we randomize for now
             gamma = torch.randn(C, 1, device=X.device)
