@@ -9,7 +9,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
 import numpy as np
 from torch.cuda.amp import autocast
-
+from math import ceil
+from torch.utils.data import Subset
 
 # --- CONFIG ---
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -36,6 +37,7 @@ model = AutoModelForCausalLM.from_pretrained(
     low_cpu_mem_usage=True,
 ).to(device)
 model.gradient_checkpointing_enable()
+model.config.use_cache = False  # Important when using gradient checkpointing
 
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
@@ -50,7 +52,7 @@ for param in model.parameters():
     param.requires_grad = False
 
 
-for layer_idx, head_idx in selected_heads:
+for layer_idx in set(l for (l, _) in selected_heads):
     o_proj = model.model.layers[layer_idx].self_attn.o_proj
 
     if o_proj.weight is not None:
@@ -61,6 +63,21 @@ for layer_idx, head_idx in selected_heads:
         o_proj.bias.requires_grad = True
         params_to_update.append(o_proj.bias)
 
+# After your parameter setup code, add this debug check:
+print("Checking parameter setup:")
+for layer_idx, head_idx in selected_heads:
+    o_proj = model.model.layers[layer_idx].self_attn.o_proj
+    print(f"Layer {layer_idx}, Head {head_idx}:")
+    print(f"  Weight requires_grad: {o_proj.weight.requires_grad}")
+    print(f"  Weight grad_fn: {o_proj.weight.grad_fn}")
+    if o_proj.bias is not None:
+        print(f"  Bias requires_grad: {o_proj.bias.requires_grad}")
+        print(f"  Bias grad_fn: {o_proj.bias.grad_fn}")
+
+# After setting up parameters_to_update, verify the optimizer:
+print("Optimizer parameters:")
+for param in params_to_update:
+    print(f"Parameter shape: {param.shape}, requires_grad: {param.requires_grad}")
 
 optimizer = torch.optim.Adam(params_to_update, lr=lr)
 
@@ -71,63 +88,64 @@ collected_outputs = {}
 @torch.no_grad()
 def evaluate_model(model, dataloader, selected_heads):
     model.eval()
-    print("\n🔍 Running evaluation on concatenated head outputs...")
+    forward_saved_inputs.clear()
 
-    X_all = []
-    y_all = []
-    collected_outputs.clear()
+    all_acts = []
+    all_labels = []
 
     for batch in dataloader:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        label = batch["label"].to(device)
+        labels = batch["label"].to(device)
 
-        _ = model(input_ids=input_ids, attention_mask=attention_mask)
+        input_embeds = model.get_input_embeddings()(input_ids)
+        outputs = model(input_embeds=input_embeds, attention_mask=attention_mask)
 
-        # Collect and concatenate activations
-        head_acts = [collected_outputs[(l, h)] for (l, h) in selected_heads]
-        head_concat = torch.cat(head_acts, dim=-1).squeeze(0)  # [K * D_head]
+        head_acts = []
+        for (layer_idx, head_idx) in selected_heads:
+            o_proj = model.model.layers[layer_idx].self_attn.o_proj
+            o_proj_input = forward_saved_inputs[layer_idx]
+            if o_proj_input.ndim == 3:
+                o_proj_input = o_proj_input[:, -1, :]
+            full_output = o_proj(o_proj_input)
+            head_dim = model.config.hidden_size // model.config.num_attention_heads
+            start = head_idx * head_dim
+            end = (head_idx + 1) * head_dim
+            head_acts.append(full_output[:, start:end])
 
-        X_all.append(head_concat.cpu().numpy())
-        y_all.append(label)
+        concat = torch.cat(head_acts, dim=-1)  # [B, K * D_head]
+        all_acts.append(concat.cpu())
+        all_labels.append(labels.cpu())
 
-    X_all = np.stack(X_all)
-    y_all = np.array(y_all)
+    X = torch.cat(all_acts).numpy()
+    y = torch.cat(all_labels).numpy()
 
-    # Train-test split
-    
-    X_train, X_test, y_train, y_test = train_test_split(X_all, y_all, test_size=0.2, random_state=42)
-
+    # Train a quick linear classifier on eval set
     clf = LogisticRegression(max_iter=1000)
-    clf.fit(X_train, y_train)
+    clf.fit(X, y)
 
-    y_pred = clf.predict(X_test)
-    y_prob = clf.predict_proba(X_test)[:, 1]
+    preds = clf.predict(X)
+    probs = clf.predict_proba(X)[:, 1]
 
-    acc = accuracy_score(y_test, y_pred)
-    f1 = f1_score(y_test, y_pred)
-    auc = roc_auc_score(y_test, y_prob)
-
-    print(f"✅ Eval after step:")
-    print(f"Accuracy: {acc:.4f} | F1: {f1:.4f} | AUC: {auc:.4f}")
-    model.train()
+    print("✅ Evaluation (on held-out Theta subset):")
+    print(f"Accuracy: {accuracy_score(y, preds):.4f} | "
+          f"F1: {f1_score(y, preds):.4f} | "
+          f"AUC: {roc_auc_score(y, probs):.4f}")
 
 
+forward_saved_inputs = {}
 
-def make_hook(layer_idx, head_idx):
+def make_hook(layer_idx):
     def hook_fn(module, input, output):
-        head_dim = output.shape[-1] // model.config.num_attention_heads
-        start = head_idx * head_dim
-        end = (head_idx + 1) * head_dim
-        collected_outputs[(layer_idx, head_idx)] = output[:, -1, start:end]  # [B, D_head]
-        print(f"[Hook] Layer {layer_idx}, Head {head_idx}, Output Shape: {output[:, -1, start:end].shape}")
+        # Save the input for this forward pass, don't store inside the module!
+        forward_saved_inputs[layer_idx] = input[0]
+        # print(f"[Hook] Layer {layer_idx} o_proj input shape: {input[0].shape}")
     return hook_fn
 
-# Register per (layer, head)
-for (layer_idx, head_idx) in selected_heads:
+# Register hooks once per layer (not per head)
+for layer_idx in set(l for (l, _) in selected_heads):
     o_proj = model.model.layers[layer_idx].self_attn.o_proj
-    o_proj.register_forward_hook(make_hook(layer_idx, head_idx))
-
+    o_proj.register_forward_hook(make_hook(layer_idx))
 
 
 
@@ -160,36 +178,65 @@ class ToxicDataset(Dataset):
 
 
 dataset = ToxicDataset("./dataset/vicuna-13b_toxic.json", "./dataset/vicuna-13b_nontoxic.json", tokenizer, max_len=max_length)
-dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+
+# Shuffle and split dataset indices
+indices = list(range(len(dataset)))
+np.random.seed(42)
+np.random.shuffle(indices)
+
+split_idx = int(0.8 * len(indices))
+train_indices = indices[:split_idx]
+eval_indices = indices[split_idx:]
+
+train_loader = DataLoader(Subset(dataset, train_indices), batch_size=batch_size, shuffle=True)
+eval_loader = DataLoader(Subset(dataset, eval_indices), batch_size=16, shuffle=False) 
 
 # --- TRAIN LOOP ---
 step = 0
 accumulated_samples = 0
 virtual_batch_size = 64
 
-for epoch in tqdm(range(epochs), desc="Epochs"):
-    model.train()
-    for batch in dataloader:
-        collected_outputs.clear()
+progress_bar = tqdm(total=epochs * ceil(len(train_loader) / (virtual_batch_size or 1)), desc="Steps")
 
+
+for epoch in range(epochs):
+    model.train()
+    for batch in train_loader:
+        collected_outputs.clear()
         input_ids = batch['input_ids'].to(device)
+        input_embeds = model.get_input_embeddings()(input_ids)
+        input_embeds.requires_grad = True  # Force graph tracking
         attention_mask = batch['attention_mask'].to(device)
         labels = batch['label'].to(device).unsqueeze(1)
         batch_size_actual = input_ids.size(0)
-        with autocast(dtype=torch.float16):  # Ensures grad compatibility with fp16
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-
-            # --- Collect only selected heads ---
+        with autocast(dtype=torch.float16):
+            # outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            outputs = model(inputs_embeds=input_embeds, attention_mask=attention_mask)
+            # Collect head activations
             head_acts = []
             for (layer_idx, head_idx) in selected_heads:
-                key = (layer_idx, head_idx)
-                if key not in collected_outputs:
-                    raise RuntimeError(f"Missing collected output for {key}. Hook likely not triggered.")
-                head_acts.append(collected_outputs[key])
+                o_proj = model.model.layers[layer_idx].self_attn.o_proj
+                o_proj_input = forward_saved_inputs[layer_idx]  # Retrieved from forward hook
+                
+                # Handle both 2D and 3D input shapes
+                if len(o_proj_input.shape) == 3:  # [B, T, D]
+                    o_proj_input = o_proj_input[:, -1, :]  # [B, D]
+                # If it's already 2D [B, D], use it as is
+                
+                full_output = o_proj(o_proj_input)     # [B, D]
+                
+                head_dim = model.config.hidden_size // model.config.num_attention_heads
+                start = head_idx * head_dim
+                end = (head_idx + 1) * head_dim
+                head_acts.append(full_output[:, start:end])  # [B, D_head]
 
+            # Stack the head activations
             head_tensor = torch.stack(head_acts, dim=1)  # [B, K, D_head]
-            B, K, D = head_tensor.shape
-
+            B = head_tensor.shape[0]
+            K = head_tensor.shape[1]
+            D = head_tensor.shape[2]
+            
             # --- Confounders ---
             indices = batch["index"].to(device)
             c_batch = C[indices]
@@ -216,7 +263,10 @@ for epoch in tqdm(range(epochs), desc="Epochs"):
             CtC = torch.einsum("bd,be->de", Cc, Cc)
             CtY = torch.einsum("bd,bl->dl", Cc, Y.unsqueeze(1))
             I2 = torch.eye(Cc.shape[1], device=device)
-            gamma = torch.linalg.solve(CtC + lambda_reg * I2, CtY).to(Cc.dtype)
+            A2 = (CtC + lambda_reg * I2).to(torch.float32)
+            B2 = CtY.to(torch.float32)
+            gamma = torch.linalg.solve(A2, B2).to(Cc.dtype)  # cast back to original dtype
+
 
             # --- projections ---
             proj = torch.einsum("bkd,kdl->bkl", Xc, beta).squeeze(-1)  # [B, K]
@@ -228,6 +278,17 @@ for epoch in tqdm(range(epochs), desc="Epochs"):
             logpns = (term1 + term2) / (2 * sigma_sq)
 
             loss = -logpns.sum()
+
+        # Check the data type of the loss tensor
+        # print(f"Loss dtype: {loss.dtype}")
+        # print(f"Loss requires_grad: {loss.requires_grad}")
+
+        # # Check the data type of the model's parameters
+        # print(f"Model parameter dtype: {model.parameters().__next__().dtype}")
+        # print(f"Model parameter requires_grad: {model.parameters().__next__().requires_grad}")
+
+        # # Check if the model is in training mode
+        # print(f"Model training mode: {model.training}")
 
         assert loss.requires_grad, "Loss doesn't require grad, check dtype or computation path"
         loss.backward()
@@ -257,14 +318,16 @@ for epoch in tqdm(range(epochs), desc="Epochs"):
             optimizer.step()
             optimizer.zero_grad()
             step += 1
+            progress_bar.set_description(f"Step {step}")
+            progress_bar.set_postfix(loss=loss.item())
+            progress_bar.update(1)
             accumulated_samples = 0  # reset counter
 
             # Optional: Eval after N steps
             if step % 100 == 0:
-                evaluate_model(model, dataloader, selected_heads)
-
-
-    print(f"Loss: {loss.item():.4f}")
+                evaluate_model(model, eval_oader, selected_heads)
+    progress_bar.close()
     
 
 print(f"\n✅ {model_name} log-PNS fine-tuning complete.")
+
