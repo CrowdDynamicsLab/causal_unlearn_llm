@@ -33,6 +33,7 @@ HF_NAMES = {
     'llama3_70B': 'meta-llama/Meta-Llama-3-70B',
     'llama3_70B_instruct': 'meta-llama/Meta-Llama-3-70B-Instruct',
     'vicuna_13b': 'lmsys/vicuna-13b-v1.5',
+    'vicuna_pns': '/projects/bdeb/chenyuen0103/toxic/models/vicuna_13b_toxigen_vicuna_logpns_finetuned_epoch5_lr0.0001_bs128_lambda0.01',
 }
 
 def main(): 

@@ -36,7 +36,7 @@ HF_NAMES = {
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
     'honest_llama2_chat_70B': 'results_dump/llama2_chat_70B_seed_42_top_48_heads_alpha_15', 
     'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
-    # 'vicuna_pns': '/projects/bdeb/chenyuen0103/toxic/models/vicuna_13b_toxigen_vicuna_logpns_finetuned_epoch5_lr0.0001_bs128_lambda0.01.pt',
+    'vicuna_pns': '/projects/bdeb/chenyuen0103/toxic/models/vicuna_13b_toxigen_vicuna_logpns_finetuned_epoch5_lr0.0001_bs128_lambda0.01',
     'vicuna_pns': 'lmsys/vicuna-13b-v1.5',
     'llama3_8B': 'meta-llama/Meta-Llama-3-8B',
 }
@@ -97,14 +97,14 @@ def main():
             MODEL, low_cpu_mem_usage=True, torch_dtype=torch.float16, device_map="auto"
         )
     else:
-        model = LlamaForCausalLM.from_pretrained(MODEL, low_cpu_mem_usage = True, torch_dtype=torch.float16, device_map="auto")
-    
-    if args.model_name == "vicuna_pns":
-        checkpoint_path = "/projects/bdeb/chenyuen0103/toxic/models/vicuna_13b_toxigen_vicuna_logpns_finetuned_epoch5_lr0.0001_bs128_lambda0.01.pt"
-        checkpoint = torch.load(checkpoint_path, map_location="cuda")
+        model = AutoModelForCausalLM.from_pretrained(
+            "/projects/bdeb/chenyuen0103/toxic/models/vicuna_13b_toxigen_vicuna_logpns_finetuned_epoch5_lr0.0001_bs128_lambda0.01",
+            torch_dtype=torch.float16,
+            local_files_only=True
+        )
 
-        # Step 3: Restore model state
-        model.load_state_dict(checkpoint['model_state_dict'])
+    
+
     # define number of layers and heads
     try:
         num_layers = model.config.num_hidden_layers
@@ -216,6 +216,9 @@ def main():
             top_heads, pns_scores = get_top_heads_pns(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels,
                         separated_head_wise_c, num_layers, num_heads, num_to_intervene=args.num_heads, lambda_reg=1e-4, sigma_sq=1.0, seed=42, use_random_dir=args.use_random_dir)
             np.save(f'./features/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_{i}_pns_scores.npy', pns_scores)
+            probes = None
+        if args.model_name == "vicuna_pns":
+            top_heads = np.load(f'./features/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_{i}_top_heads.npy')
             probes = None
         else:
             top_heads, probes = get_top_heads(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, num_layers, num_heads, args.seed, args.num_heads, args.use_random_dir)
