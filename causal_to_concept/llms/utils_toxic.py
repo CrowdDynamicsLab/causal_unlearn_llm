@@ -292,7 +292,7 @@ def train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=1, 
     c_all = torch.cat([train_mu, val_mu], dim=0)  # shape: [N_total, z_dim]
     acc, f1 = evaluate_latent_mu(train_mu, y_train, val_mu, y_val)
     print("c_all size", c_all.size())
-    torch.save(c_all, f"/work/hdd/bcxt/yian3/toxic/features/{model_name}_{dataset_name}_c_all.pt")
+    torch.save(c_all, f"/projects/bdeb/chenyuen0103/toxic/features/{model_name}_{dataset_name}_c_all.pt")
     return train_mu, val_mu, c_all
 
 def evaluate_latent_mu(train_mu, y_train, val_mu, y_val, seed=42):

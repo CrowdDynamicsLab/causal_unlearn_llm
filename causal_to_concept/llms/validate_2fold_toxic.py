@@ -36,7 +36,7 @@ HF_NAMES = {
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
     'honest_llama2_chat_70B': 'results_dump/llama2_chat_70B_seed_42_top_48_heads_alpha_15', 
     'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
-    'llama3_8B': 'meta-llama/Llama-3.2-8B',
+    'llama3_8B': 'meta-llama/Meta-Llama-3-8B',
 }
 
 def main(): 
@@ -90,18 +90,7 @@ def main():
     model_name = HF_NAMES["honest_" + args.model_name if args.use_honest else args.model_name]
     MODEL = model_name if not args.model_dir else args.model_dir
 
-    if "gpt2" in args.model_name:
-        tokenizer = AutoTokenizer.from_pretrained(MODEL)
-        model = GPT2LMHeadModel.from_pretrained(
-            MODEL, low_cpu_mem_usage=True, torch_dtype=torch.float16, device_map="auto"
-        )
-    else:
-
-        if args.model_name == 'llama_1B' or args.model_name == 'llama_3B':
-            tokenizer = AutoTokenizer.from_pretrained(MODEL)
-        else:
-            tokenizer = LlamaTokenizer.from_pretrained(MODEL)
-        model = LlamaForCausalLM.from_pretrained(MODEL, low_cpu_mem_usage = True, torch_dtype=torch.float16, device_map="auto")
+    model = LlamaForCausalLM.from_pretrained(MODEL, low_cpu_mem_usage = True, torch_dtype=torch.float16, device_map="auto")
     
     
     # define number of layers and heads
