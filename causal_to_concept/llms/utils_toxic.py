@@ -40,6 +40,7 @@ ENGINE_MAP = {
     'llama2_chat_13B': 'meta-llama/Llama-2-13b-chat-hf', 
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
     'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
+    'vicuna_pns': '/work/hdd/bcxt/yian3/models/vicuna_pns_finetuned'
 }
 
 from TruthfulQA.truthfulqa.utilities import (
@@ -242,7 +243,7 @@ def get_all_mu(vae, data_tensor, batch_size=256, device='cuda'):
 def train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=1, h_dim1=128, h_dim2=64,
                               batch_size=128, lr=1e-3, vae_epochs=20, dataset_name=None, model_name=None, device='cuda'):
     # Flatten if needed
-    # print(np.array(head_wise_activations).nbytes / 1e9, "GB")
+    print("LENGTH OF HEADWISE ACTIVATIONS", len(head_wise_activations))
     split = int(0.8 * len(head_wise_activations))
     train_raw = head_wise_activations[:split]
     val_raw = head_wise_activations[split:]
@@ -341,6 +342,7 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
     tokens = []
     for idx in frame.index: 
         if pd.isnull(frame.loc[idx, tag]) or not len(frame.loc[idx, tag]):
+            # print("PRESET", preset)
             prompt = format_prompt(frame.loc[idx], preset, format='none') #frame.loc[idx,'text']# 
             if use_special_direction:
                 prompt_encoding = sentence_embedding.encode(frame.loc[idx, 'text'])
@@ -378,7 +380,7 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
     with torch.no_grad():
         for idx, input_ids in enumerate(tqdm(tokens)):
             max_len = input_ids.shape[-1] + 50
-            print("IDX", idx)
+            # print("IDX", idx)
             # --- intervention code --- #
             with TraceDict(model, layers_to_intervene, edit_output=intervene) as ret: 
                 input_ids = input_ids.to(model.device)
@@ -396,6 +398,7 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
             
             frame.loc[idx, tag] = model_gen_str
             if not model_gen_str: 
+                print("broke")
                 break
             sequences.append(model_gen_str)
 
@@ -687,24 +690,26 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
                 print(err)
 
         # llama
-        if mdl in ['llama_1B', 'llama_3B', 'llama_7B', 'alpaca_7B', 'vicuna_13B', 'llama2_chat_7B', 'llama2_chat_13B', 'llama2_chat_70B']: 
+        if mdl in ['llama_1B', 'llama_3B', 'llama_7B', 'alpaca_7B', 'vicuna_13B', 'vicuna_pns', 'llama2_chat_7B', 'llama2_chat_13B', 'llama2_chat_70B']: 
 
             assert models[mdl] is not None, 'must provide llama model'
             llama_model = models[mdl]
-            if mdl == 'llama_1B' or mdl == 'llama_3B' or mdl == 'vicuna_13B':
+            if mdl == 'llama_1B' or mdl == 'llama_3B' or mdl == 'vicuna_13B' or mdl == 'vicuna_pns':
                 llama_tokenizer = AutoTokenizer.from_pretrained(ENGINE_MAP[mdl], load_in_8bit=True,)
             else:
                 llama_tokenizer = LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
             # llama_tokenizer = llama.LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
             
             if 'judge' in metric_names or 'info' in metric_names: 
+                print("TRUE judge")
                 questions, sequences = tqa_run_answers(questions, ENGINE_MAP[mdl], mdl, preset, model=llama_model, tokenizer=llama_tokenizer,
                                 device=device, cache_dir=cache_dir, verbose=verbose,
                                 interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
-            print(len(questions))
+            print("JUDGE INFO length", len(questions))
             utilities.save_questions(questions, output_path)
 
             if 'mc' in metric_names:
+                print("TRUE")
                 questions = tqa_run_probs(questions, ENGINE_MAP[mdl], mdl, model=llama_model, tokenizer=llama_tokenizer, preset=preset, device=device, cache_dir=cache_dir, verbose=False, interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
                 utilities.save_questions(questions, output_path)
         
@@ -767,6 +772,7 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
     utilities.save_questions(questions, output_path)
 
     # # format and print basic results
+
     results = format_frame(questions)
     results = results.mean(axis=0)
     results = results.reset_index().rename(columns={'level_0': 'Model',
@@ -872,10 +878,32 @@ def get_top_heads_pns(train_idxs, val_idxs, separated_head_wise_activations,  # 
     C = c_all.shape[1]
     logpns_scores = np.zeros((L, H))
 
+    ###################################################
+        # XtX = torch.einsum("bkd,bke->kde", Xc, Xc)
+        # XtY = torch.einsum("bkd,b->kd", Xc, Y).unsqueeze(2)  # Result: [K, D]
+        # I = torch.eye(D, device=device).expand(K, -1, -1)
+        # A = (XtX + lambda_reg * I).to(torch.float32)
+        # B_ = XtY.to(torch.float32)
+        # beta = torch.linalg.solve(A, B_).to(Xc.dtype)          # [K, D, 1]
+        # # --- gamma: from confounder C to Y ---
+        # CtC = torch.einsum("bd,be->de", Cc, Cc)
+        # # breakpoint()
+        # CtY = torch.einsum("bd,bl->dl", Cc, Y.unsqueeze(1))
+        # I2 = torch.eye(Cc.shape[1], device=device)
+        # gamma = torch.linalg.solve(CtC + lambda_reg * I2, CtY).to(Cc.dtype)  # [D_c, 1]
+        # # --- projection and confounder adjustment ---
+        # proj = torch.einsum("bkd,kdl->bkl", Xc, beta).squeeze(-1)            # [B, K]
+        # conf = torch.matmul(Cc, gamma).squeeze(-1)                          # [B]
+        # conf_adj = proj * conf.unsqueeze(1)                                 # [B, K]
+        # term1 = (proj**2).sum(0)                                            # [K]
+        # term2 = 2 * conf_adj.sum(0)                                         # [K]
+        # logpns = (term1 + term2) / (2 * sigma_sq)
+    ###################################################
+
     for l in tqdm(range(num_layers)):
         for h in range(num_heads):
             X = all_X[:, l, h, :]  # [N, D]
-            y = y_all              # [N, 1]
+            y = 2 * y_all - 1              # [N, 1] 
             c = c_all              # [N, C]
 
             # Ridge regression: β = (XᵗX + λI)⁻¹ Xᵗy
@@ -900,6 +928,19 @@ def get_top_heads_pns(train_idxs, val_idxs, separated_head_wise_activations,  # 
 
     # Flatten and select top heads
     flattened_scores = logpns_scores.reshape(-1)
+    # # print("flattened_scores", logpns_scores)
+    # # Get indices of the top 36 elements
+    # top_indices_flat = np.argpartition(flattened_scores, -36)[-36:]
+
+    # # Sort these indices by value (descending)
+    # top_indices_flat = top_indices_flat[np.argsort(flattened_scores[top_indices_flat])[::-1]]
+    # # Convert flat indices back to (layer, head) indices
+    # top_layers, top_heads = np.unravel_index(top_indices_flat, logpns_scores.shape)
+    # top_values = logpns_scores[top_layers, top_heads]
+
+    # print("Top 36 (layer, head, score):")
+    # for l, h, v in zip(top_layers, top_heads, top_values):
+    #     print(f"Layer {l}, Head {h}: {v:.4f}")
     if use_random_dir:
         random_idxs = np.random.choice(num_layers * num_heads, num_layers * num_heads, replace=False)
         top_heads = [flattened_idx_to_layer_head(idx, num_heads) for idx in random_idxs[:num_to_intervene]]
@@ -909,6 +950,17 @@ def get_top_heads_pns(train_idxs, val_idxs, separated_head_wise_activations,  # 
 
     return top_heads, logpns_scores
 
+def get_proj_params(model, top_heads):
+    params = []
+    seen = set()
+    for l, h in top_heads:
+        proj = model.model.layers[l].self_attn.o_proj
+        if id(proj.weight) not in seen:
+            proj.requires_grad_(True)
+            params.append(proj.weight)
+            seen.add(id(proj.weight))
+    return params
+    
 def get_interventions_dict(top_heads, probes, tuning_activations, num_heads, use_center_of_mass, use_random_dir, use_mat_direction, use_special_direction, com_directions):
     
     interventions = {}
@@ -1021,6 +1073,7 @@ def get_activations(labels, head_wise_activations, head_wise_c, dataset, model_n
     used_idxs = set()
     
     for i in range(0, len(labels), 2):
+        # print("i", i)
         group_acts = [head_wise_activations[i], head_wise_activations[i+1]]
         group_labels = [labels[i], labels[i+1]]
         group_cs = [head_wise_c[i], head_wise_c[i+1]]

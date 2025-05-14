@@ -36,6 +36,7 @@ HF_NAMES = {
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
     'honest_llama2_chat_70B': 'results_dump/llama2_chat_70B_seed_42_top_48_heads_alpha_15', 
     'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
+    'vicuna_pns': '/work/hdd/bcxt/yian3/models/vicuna_pns_finetuned'
     'llama3_8B': 'meta-llama/Meta-Llama-3-8B',
 }
 
@@ -161,7 +162,7 @@ def main():
     else:
         print(f"No cached c_all found. Training VAE and saving to {c_path}")
         head_wise_c = train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=32, h_dim1=128, h_dim2=64,
-                                batch_size=128, lr=1e-3, vae_epochs=100, dataset_name=args.dataset_name, model_name=args.model_name, device='cuda')
+                                batch_size=128, lr=1e-3, vae_epochs=10, dataset_name=args.dataset_name, model_name=args.model_name, device='cuda')
     
     # separated_head_wise_activations, separated_labels, idxs_to_split_at = get_separated_activations(labels, head_wise_activations, categories[:100], args.dataset_name)
     separated_head_wise_activations, separated_labels, separated_head_wise_c, idxs_to_split_at = get_activations(labels, head_wise_activations, head_wise_c, args.dataset_name, args.model_name)
@@ -180,9 +181,9 @@ def main():
         val_set_idxs = np.array([x for x in train_idxs if x not in train_set_idxs])
 
         # save train and test splits
-        df.iloc[train_set_idxs].to_csv(f"splits/{args.dataset_name}_fold_{i}_train_seed_{args.seed}.csv", index=False)
-        df.iloc[val_set_idxs].to_csv(f"splits/{args.dataset_name}_fold_{i}_val_seed_{args.seed}.csv", index=False)
-        df.iloc[test_idxs].to_csv(f"splits/{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv", index=False)
+        df.iloc[train_set_idxs].to_csv(f"splits/{args.model_name}_{args.dataset_name}_fold_{i}_train_seed_{args.seed}.csv", index=False)
+        df.iloc[val_set_idxs].to_csv(f"splits/{args.model_name}_{args.dataset_name}_fold_{i}_val_seed_{args.seed}.csv", index=False)
+        df.iloc[test_idxs].to_csv(f"splits/{args.model_name}_{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv", index=False)
 
         # get directions
         if args.use_center_of_mass:
@@ -309,10 +310,11 @@ def main():
             output_path = f'results_dump/answer_dump/{args.dataset_name}_{filename}.csv'
             summary_path = f'results_dump/summary_dump/{args.dataset_name}_{filename}.csv'
         elif args.dataset_name == 'toxigen_vicuna' or args.dataset_name == 'hate_vicuna':
-            input_path = f'splits/{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv'
+            input_path = f'splits/{args.model_name}_{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv'
             output_path = f'results_dump/answer_dump/{prefix}_answer_{args.dataset_name}_{filename}.csv'
             summary_path = f'results_dump/summary_dump/{prefix}_summary_{args.dataset_name}_{filename}.csv'
             
+        print("input_path", input_path)
         curr_fold_results = alt_tqa_evaluate(
             {args.model_name: model}, 
             ['judge', 'info'], #, 'mc'
