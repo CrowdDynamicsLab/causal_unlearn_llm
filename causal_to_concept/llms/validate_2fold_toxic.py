@@ -36,7 +36,8 @@ HF_NAMES = {
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
     'honest_llama2_chat_70B': 'results_dump/llama2_chat_70B_seed_42_top_48_heads_alpha_15', 
     'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
-    'vicuna_pns': '/work/hdd/bcxt/yian3/models/vicuna_pns_finetuned'
+    # 'vicuna_pns': '/projects/bdeb/chenyuen0103/toxic/models/vicuna_13b_toxigen_vicuna_logpns_finetuned_epoch5_lr0.0001_bs128_lambda0.01.pt',
+    'vicuna_pns': 'lmsys/vicuna-13b-v1.5',
     'llama3_8B': 'meta-llama/Meta-Llama-3-8B',
 }
 
@@ -98,7 +99,12 @@ def main():
     else:
         model = LlamaForCausalLM.from_pretrained(MODEL, low_cpu_mem_usage = True, torch_dtype=torch.float16, device_map="auto")
     
-    
+    if args.model_name == "vicuna_pns":
+        checkpoint_path = "/projects/bdeb/chenyuen0103/toxic/models/vicuna_13b_toxigen_vicuna_logpns_finetuned_epoch5_lr0.0001_bs128_lambda0.01.pt"
+        checkpoint = torch.load(checkpoint_path, map_location="cuda")
+
+        # Step 3: Restore model state
+        model.load_state_dict(checkpoint['model_state_dict'])
     # define number of layers and heads
     try:
         num_layers = model.config.num_hidden_layers
@@ -117,17 +123,17 @@ def main():
             categories = pickle.load(f)  # List of target groups, 1 per sentence
         # tuning dataset: no labels used, just to get std of activations along the direction
         activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
-        tuning_activations = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_head_wise.npy")[:6]
+        tuning_activations = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_head_wise.npy")[:6]
         tuning_activations = rearrange(tuning_activations, 'b l (h d) -> b l h d', h = num_heads)
-        tuning_labels = np.load(f"/projects/bdmr/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_labels.npy")[:6]
+        tuning_labels = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{activations_dataset}_labels.npy")[:6]
 
     elif args.dataset_name == "hate":
         head_wise_activations = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy")
         # head_wise_activations = head_wise_activations[indices]
-        # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy", head_wise_activations)
+        # np.save(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_head_wise.npy", head_wise_activations)
         labels = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy")
         # labels = labels[indices]
-        # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy", labels)
+        # np.save(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{args.dataset_name}_labels.npy", labels)
         head_wise_activations = rearrange(head_wise_activations, 'b l (h d) -> b l h d', h = num_heads)
         with open(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl", "rb") as f:
             categories = pickle.load(f)  # List of target groups, 1 per sentence
@@ -137,11 +143,11 @@ def main():
         activations_dataset = args.dataset_name if args.activations_dataset is None else args.activations_dataset
         tuning_activations = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy")
         # tuning_activations = tuning_activations[indices]
-        # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy", tuning_activations)
+        # np.save(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_head_wise.npy", tuning_activations)
         tuning_activations = rearrange(tuning_activations, 'b l (h d) -> b l h d', h = num_heads)
         tuning_labels = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy")
         # tuning_labels = tuning_labels[indices]
-        # np.save(f"/projects/bdmr/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy", tuning_labels)
+        # np.save(f"/projects/bdeb/chenyuen0103/toxic/features/shuffled_{args.model_name}_{activations_dataset}_labels.npy", tuning_labels)
 
     elif args.dataset_name == "hate_vicuna" or args.dataset_name == "toxigen_vicuna":
         head_wise_activations = np.load(f"/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy") # [:200]

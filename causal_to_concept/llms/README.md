@@ -20,3 +20,4 @@ python validate_2fold_toxic.py llama_3B --num_heads 72 --alpha 15 --seed 2 --dev
 
 python validate_2fold_toxic.py llama3_8B --num_heads 18 --alpha 0 --seed 0 --device 0 --num_fold 2 --use_special_direction
 
+python validate_2fold_toxic.py  vicuna_pns --num_heads 10 --alpha 5 --seed 0 --device 0 --num_fold 2 --use_special_direction
