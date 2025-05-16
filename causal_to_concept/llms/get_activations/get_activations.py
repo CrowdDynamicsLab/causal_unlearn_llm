@@ -32,8 +32,10 @@ HF_NAMES = {
     'llama3_8B_instruct': 'meta-llama/Meta-Llama-3-8B-Instruct',
     'llama3_70B': 'meta-llama/Meta-Llama-3-70B',
     'llama3_70B_instruct': 'meta-llama/Meta-Llama-3-70B-Instruct',
-    'vicuna_13b': 'lmsys/vicuna-13b-v1.5',
-    'vicuna_pns': '/projects/bdeb/chenyuen0103/toxic/models/vicuna_13b_toxigen_vicuna_logpns_finetuned_epoch5_lr0.0001_bs128_lambda0.01',
+    'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
+    'vicuna_pns': '/work/hdd/bcxt/yian3/models/vicuna_pns_finetuned',
+    'COV_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_finetuned_epoch5',
+    'COV_pns_use_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_True_finetuned_epoch5',
 }
 
 def main(): 
@@ -111,15 +113,15 @@ def main():
         os.makedirs(feature_dir)
     if args.dataset_name == "tqa_gen" or args.dataset_name == "tqa_gen_end_q": 
         prompts, labels, categories = formatter(dataset, tokenizer)
-        with open(f'/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
+        with open(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
             pickle.dump(categories, f)
     elif args.dataset_name == "hate" or args.dataset_name == "toxigen": 
         prompts, labels, scores, categories = formatter(dataset, tokenizer)
-        with open(f'/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
+        with open(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
             pickle.dump(categories, f)
     elif args.dataset_name == "hate_vicuna" or args.dataset_name == "toxigen_vicuna": 
         prompts, labels, texts = formatter(dataset, dataset_non, tokenizer)
-        with open(f'/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_texts.json', 'w') as f:
+        with open(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_texts.json', 'w') as f:
             for sentence in texts:
                 text = sentence[0]
                 toxic_text = sentence[1]
@@ -159,13 +161,13 @@ def main():
         i += 1
 
     print("Saving labels")
-    np.save(f'/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy', labels)
+    np.save(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy', labels)
 
     print("Saving layer wise activations")
-    np.save(f'/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_layer_wise.npy', all_layer_wise_activations)
+    np.save(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_layer_wise.npy', all_layer_wise_activations)
     
     print("Saving head wise activations")
-    np.save(f'/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy', all_head_wise_activations)
+    np.save(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy', all_head_wise_activations)
 
 if __name__ == '__main__':
     main()

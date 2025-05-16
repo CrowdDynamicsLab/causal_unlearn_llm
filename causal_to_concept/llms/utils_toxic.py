@@ -1075,7 +1075,7 @@ def get_activations(labels, head_wise_activations, head_wise_c, dataset, model_n
     used_idxs = set()
     
     for i in range(0, len(labels), 2):
-        print("i", i)
+        # print("i", i)
         group_acts = [head_wise_activations[i], head_wise_activations[i+1]]
         group_labels = [labels[i], labels[i+1]]
         group_cs = [head_wise_c[i], head_wise_c[i+1]]
@@ -1138,7 +1138,7 @@ def get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, 
             # print("direction", direction.shape)
             sp_directions.append(direction)
     sp_directions = np.array(sp_directions)
-    #np.save("directions.npy", my_array)
+    print("direction", sp_directions.shape)
     if np.isnan(sp_directions).any() or np.isinf(sp_directions).any():
         print(f"[SKIP] NaN direction in layer {layer} head {head}")
         direction = np.zeros_like(direction)
