@@ -15,7 +15,7 @@ import argparse
 from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
 
 # Specific pyvene imports
-from utils import get_llama_activations_pyvene, tokenized_tqa, tokenized_tqa_gen, tokenized_tqa_gen_end_q, tokenize_toxicity_dataset, get_gpt2_activations_pyvene
+from utils import get_llama_activations_pyvene, tokenized_tqa, tokenized_tqa_gen, tokenized_tqa_gen_end_q, tokenize_toxicity_dataset, get_gpt2_activations_pyvene, tokenize_toxigen
 from interveners import wrapper, Collector, ITI_Intervener
 import pyvene as pv
 
@@ -33,6 +33,7 @@ HF_NAMES = {
     'llama3_70B': 'meta-llama/Meta-Llama-3-70B',
     'llama3_70B_instruct': 'meta-llama/Meta-Llama-3-70B-Instruct',
     'vicuna_13b': 'lmsys/vicuna-13b-v1.5',
+    'vicuna_pns': '/projects/bdeb/chenyuen0103/toxic/models/vicuna_13b_toxigen_vicuna_logpns_finetuned_epoch5_lr0.0001_bs128_lambda0.01',
 }
 
 def main(): 
@@ -102,21 +103,23 @@ def main():
         raise ValueError("Invalid dataset name")
 
     print("Tokenizing prompts")
+    # dataset = dataset.select(range(100))
+    # dataset_non = dataset_non.select(range(100))
 
     feature_dir = f'../features'
     if not os.path.exists(feature_dir):
         os.makedirs(feature_dir)
     if args.dataset_name == "tqa_gen" or args.dataset_name == "tqa_gen_end_q": 
         prompts, labels, categories = formatter(dataset, tokenizer)
-        with open(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
+        with open(f'/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
             pickle.dump(categories, f)
     elif args.dataset_name == "hate" or args.dataset_name == "toxigen": 
         prompts, labels, scores, categories = formatter(dataset, tokenizer)
-        with open(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
+        with open(f'/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
             pickle.dump(categories, f)
     elif args.dataset_name == "hate_vicuna" or args.dataset_name == "toxigen_vicuna": 
         prompts, labels, texts = formatter(dataset, dataset_non, tokenizer)
-        with open(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_texts.json', 'w') as f:
+        with open(f'/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_texts.json', 'w') as f:
             for sentence in texts:
                 text = sentence[0]
                 toxic_text = sentence[1]
@@ -131,23 +134,14 @@ def main():
 
     collectors = []
     pv_config = []
-    if "gpt2" in args.model_name:
-        breakpoint()
-        for layer in range(model.config.n_layer):  # GPT-2 uses 'n_layer'
-            collector = Collector(multiplier=0, head=-1)  # No need for num_heads
-            collectors.append(collector)
-            pv_config.append({
-                "component": f"transformer.h[{layer}].attn.c_proj.input",  # GPT-2 equivalent
-                "intervention": wrapper(collector),
-            })
-    else:
-        for layer in range(model.config.num_hidden_layers): 
-            collector = Collector(multiplier=0, head=-1, num_heads=num_heads)
-            collectors.append(collector)
-            pv_config.append({
-                "component": f"model.layers[{layer}].self_attn.o_proj.input",
-                "intervention": wrapper(collector),
-            })
+    # num_heads = model.config.n_head
+    for layer in range(model.config.num_hidden_layers): 
+        collector = Collector(head=-1)
+        collectors.append(collector)
+        pv_config.append({
+            "component": f"model.layers[{layer}].self_attn.o_proj.input",
+            "intervention": wrapper(collector),
+        })
 
     collected_model = pv.IntervenableModel(pv_config, model)
 
@@ -165,13 +159,13 @@ def main():
         i += 1
 
     print("Saving labels")
-    np.save(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy', labels)
+    np.save(f'/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy', labels)
 
     print("Saving layer wise activations")
-    np.save(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_layer_wise.npy', all_layer_wise_activations)
+    np.save(f'/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_layer_wise.npy', all_layer_wise_activations)
     
     print("Saving head wise activations")
-    np.save(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy', all_head_wise_activations)
+    np.save(f'/projects/bdeb/chenyuen0103/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy', all_head_wise_activations)
 
 if __name__ == '__main__':
     main()
