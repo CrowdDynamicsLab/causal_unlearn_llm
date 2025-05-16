@@ -229,7 +229,7 @@ def main():
                 top_heads, probes = get_top_heads(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, num_layers, num_heads, args.seed, args.num_heads, args.use_random_dir)
             np.save(f'./features/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_{i}_top_heads.npy', top_heads)
            
-            break
+            continue
 
         if model == 'none': # model == 'COV_pns' or model == 'vicuna_pns':
             selected_heads = np.load(args.heads_path)
@@ -365,8 +365,9 @@ def main():
         curr_fold_results = curr_fold_results.to_numpy()[0].astype(float)
         results.append(curr_fold_results)
     
-    results = np.array(results)
-    final = results.mean(axis=0)
+    if args.mode != 'get_top_heads':
+        results = np.array(results)
+        final = results.mean(axis=0)
 
     # print(f'True*Info Score: {final[1]*final[0]}, True Score: {final[1]}, Info Score: {final[0]}, MC1 Score: {final[2]}, MC2 Score: {final[3]}, CE Loss: {final[4]}, KL wrt Original: {final[5]}')
 
