@@ -40,7 +40,9 @@ ENGINE_MAP = {
     'llama2_chat_13B': 'meta-llama/Llama-2-13b-chat-hf', 
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
     'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
-    'vicuna_pns': '/work/hdd/bcxt/yian3/models/vicuna_pns_finetuned'
+    'vicuna_pns': '/work/hdd/bcxt/yian3/models/vicuna_pns_finetuned',
+    'COV_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_finetuned_epoch5',
+    'COV_pns_use_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_True_finetuned_epoch5',
 }
 
 from TruthfulQA.truthfulqa.utilities import (
@@ -292,7 +294,7 @@ def train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=1, 
 
     c_all = torch.cat([train_mu, val_mu], dim=0)  # shape: [N_total, z_dim]
     acc, f1 = evaluate_latent_mu(train_mu, y_train, val_mu, y_val)
-    print("c_all size", c_all.size())
+    print("c_all size", c_all.size(), model_name)
     torch.save(c_all, f"/work/hdd/bcxt/yian3/toxic/features/{model_name}_{dataset_name}_c_all.pt")
     return train_mu, val_mu, c_all
 
@@ -690,11 +692,11 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
                 print(err)
 
         # llama
-        if mdl in ['llama_1B', 'llama_3B', 'llama_7B', 'alpaca_7B', 'vicuna_13B', 'vicuna_pns', 'llama2_chat_7B', 'llama2_chat_13B', 'llama2_chat_70B']: 
+        if mdl in ['llama_1B', 'llama_3B', 'llama_7B', 'alpaca_7B', 'vicuna_13B', 'vicuna_pns', 'COV_pns', 'COV_pns_use_pns', 'llama2_chat_7B', 'llama2_chat_13B', 'llama2_chat_70B']: 
 
             assert models[mdl] is not None, 'must provide llama model'
             llama_model = models[mdl]
-            if mdl == 'llama_1B' or mdl == 'llama_3B' or mdl == 'vicuna_13B' or mdl == 'vicuna_pns':
+            if mdl == 'llama_1B' or mdl == 'llama_3B' or mdl == 'vicuna_13B' or mdl == 'vicuna_pns' or mdl == 'COV_pns' or mdl == 'COV_pns_use_pns':
                 llama_tokenizer = AutoTokenizer.from_pretrained(ENGINE_MAP[mdl], load_in_8bit=True,)
             else:
                 llama_tokenizer = LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
@@ -796,7 +798,7 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
         # if model_key not in questions.columns:
         #     warnings.warn("Answers missing for {0}!".format(model_key), stacklevel=2)
         #     continue
-        if 'llama' in model_key or 'alpaca' in model_key or 'vicuna' in model_key:
+        if 'llama' in model_key or 'alpaca' in model_key or 'vicuna' or 'pns' in model_key:
             ce_loss = run_ce_loss(model_key, model=llama_model, tokenizer=llama_tokenizer, device=device, interventions=interventions, intervention_fn=intervention_fn, use_special_direction=use_special_direction)
             kl_wrt_orig = run_kl_wrt_orig(model_key, model=llama_model, tokenizer=llama_tokenizer, device=device, interventions=interventions, intervention_fn=intervention_fn, separate_kl_device=separate_kl_device, use_special_direction=use_special_direction)
 
@@ -1064,7 +1066,7 @@ def get_activations(labels, head_wise_activations, head_wise_c, dataset, model_n
     toxic_texts = sentences["toxic_text"]
     non_toxic_texts = sentences["non_toxic_text"]
     
-    print("SHAPES", len(labels), len(head_wise_activations), len(texts))
+    print("SHAPES", len(labels), len(head_wise_activations), len(texts), len(head_wise_c))
     
     grouped_activations = []
     grouped_labels = []
@@ -1073,7 +1075,7 @@ def get_activations(labels, head_wise_activations, head_wise_c, dataset, model_n
     used_idxs = set()
     
     for i in range(0, len(labels), 2):
-        # print("i", i)
+        print("i", i)
         group_acts = [head_wise_activations[i], head_wise_activations[i+1]]
         group_labels = [labels[i], labels[i+1]]
         group_cs = [head_wise_c[i], head_wise_c[i+1]]
