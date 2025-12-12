@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 # sys.path.insert(0, "TruthfulQA")
 
 import torch
@@ -14,15 +15,120 @@ import pandas as pd
 import warnings
 from einops import rearrange
 from transformers import AutoTokenizer, AutoModelForCausalLM, LlamaForCausalLM, LlamaTokenizer
+# Gemma3ForCausalLM, Gemma3ForConditionalGeneration, AutoProcessor
 from baukit import Trace, TraceDict
 import sklearn
+from functools import partial
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from sklearn.linear_model import LogisticRegression
+from sentence_transformers import SentenceTransformer
+from vae import VAE, vae_loss_function, train_vae, test_vae
 import pickle
 from functools import partial
 from pprint import pprint
-from sentence_transformers import SentenceTransformer
-from vae import VAE, vae_loss_function, train_vae, test_vae
+# Initialize sentence embedding model for contextual interventions
+sentence_embedding = SentenceTransformer('all-MiniLM-L6-v2')
+class RetrievalLocalSteerer:
+    """
+    Retrieval-conditioned steering: given a prompt key and (layer, head),
+    return a similarity-weighted local steering vector with optional shrinkage
+    to a provided global vector.
+    """
+    def __init__(self, store_dir, num_layers, num_heads, device='cuda'):
+        self.device = device
+        self.keys = torch.from_numpy(np.load(os.path.join(store_dir, "keys.npy"))).float()
+        self.keys = self.keys / (self.keys.norm(dim=1, keepdim=True) + 1e-8)  # unit norm
+        self.keys = self.keys.to(device)
+        self.diffs = {}  # (l,h) -> [M, d_head] tensor on device
+        for l in range(num_layers):
+            for h in range(num_heads):
+                path = os.path.join(store_dir, "diffs", f"L{l}_H{h}.npy")
+                if os.path.exists(path):
+                    arr = np.load(path, mmap_mode='r')  # memory friendly
+                    self.diffs[(l, h)] = torch.from_numpy(np.asarray(arr)).to(device=device, dtype=torch.float32)
+        print(f"[LocalSteerer] Loaded keys {tuple(self.keys.shape)}, diffs for {len(self.diffs)} heads.")
+
+    @torch.no_grad()
+    def local_vector(self, l, h, key_vec, N=64, tau=20.0, v_global=None, lam_from_sim=True):
+        """
+        key_vec: torch.FloatTensor [d_k], already on device (normalized recommended)
+        returns: v_mix [d_head] (torch.FloatTensor on device)
+        """
+        # fall back if missing
+        if (l, h) not in self.diffs:
+            return None
+
+        key = key_vec / (key_vec.norm() + 1e-8)
+        sims = self.keys @ key  # [M]
+        N = min(N, sims.shape[0])
+        topv, topi = torch.topk(sims, k=N, dim=0)
+        w = torch.softmax(tau * topv, dim=0)                  # [N]
+        D = self.diffs[(l, h)][topi]                          # [N, d_head]
+        v_local = (w[:, None] * D).sum(dim=0)                 # [d_head]
+
+        if v_global is None or not lam_from_sim:
+            return v_local
+        lam = float(torch.clamp(0.5 / (topv.mean() + 1e-6), 0.0, 1.0))  # shrink if weak
+        v_mix = (1.0 - lam) * v_local + lam * torch.as_tensor(v_global, device=self.device, dtype=v_local.dtype)
+        return v_mix
+
+
+def create_local_builder(global_interventions, local_steerer, retrieval_N=64, retrieval_tau=20.0):
+    """
+    Create a local_builder function that returns per-example interventions
+    compatible with the existing intervention structure.
+    """
+    def local_builder(prompt_text, k=64):
+        """
+        Build local interventions for a given prompt text.
+        Returns interventions dict in same format as global_interventions.
+        """
+        if local_steerer is None:
+            return None
+            
+        # Encode the prompt (assuming sentence_embedding is available globally)
+        try:
+            key_vec = sentence_embedding.encode(prompt_text)
+            key_vec = torch.tensor(key_vec, dtype=torch.float32, device=local_steerer.device)
+        except:
+            return None
+            
+        local_interventions = {}
+        
+        for layer_name, head_list in global_interventions.items():
+            # Parse layer index from layer_name (e.g., "model.layers.8.self_attn")
+            if "gpt2" in layer_name:
+                layer = int(layer_name.split('.')[1])
+            else:
+                layer = int(layer_name.split('.')[2])
+                
+            local_head_list = []
+            
+            for head, direction, proj_val_std in head_list:
+                # Get local vector for this (layer, head)
+                v_global = direction if len(direction.shape) == 1 else None
+                v_mix = local_steerer.local_vector(
+                    layer, head, key_vec, 
+                    N=min(k, retrieval_N), 
+                    tau=retrieval_tau,
+                    v_global=v_global, 
+                    lam_from_sim=True
+                )
+                
+                if v_mix is not None:
+                    # Use local vector
+                    local_head_list.append((head, v_mix.cpu().numpy(), proj_val_std))
+                else:
+                    # Fall back to global
+                    local_head_list.append((head, direction, proj_val_std))
+                    
+            local_interventions[layer_name] = local_head_list
+            
+        return local_interventions
+    
+    return local_builder
+
+
 
 from TruthfulQA.truthfulqa import utilities, models, metrics
 import openai
@@ -39,10 +145,43 @@ ENGINE_MAP = {
     'llama2_chat_7B': 'meta-llama/Llama-2-7b-chat-hf', 
     'llama2_chat_13B': 'meta-llama/Llama-2-13b-chat-hf', 
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
+    'llama3_8B': 'meta-llama/Meta-Llama-3-8B',
     'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
+    'gemma3_4B': 'google/gemma-3-4b-it',
     'vicuna_pns': '/work/hdd/bcxt/yian3/models/vicuna_pns_finetuned',
     'COV_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_finetuned_epoch5',
     'COV_pns_use_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_True_finetuned_epoch5',
+    'vicuna_13B_toxigen_vicuna_18_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_accuracy_18_False_0.0001_finetuned_epoch5',
+    'vicuna_13B_toxigen_vicuna_18_0.01_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_True_0.01_finetuned_epoch5',
+    'vicuna_13B_toxigen_vicuna_18_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_True_0.0001_finetuned_epoch5',
+    'vicuna_13B_toxigen_vicuna_36_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_accuracy_36_False_0.0001_finetuned_epoch5',
+    'vicuna_13B_toxigen_vicuna_36_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_36_True_0.0001_finetuned_epoch5',
+    'vicuna_13B_toxigen_vicuna_72_0.01_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_72_True_0.01_finetuned_epoch5',
+    'vicuna_13B_toxigen_vicuna_72_0.01_acc': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_accuracy_72_False_0.01_finetuned_epoch5',
+    'llama3_8B_toxigen_vicuna_72_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_accuracy_72_False_0.0001_finetuned_epoch5',
+    'llama3_8B_toxigen_vicuna_72_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_72_True_0.0001_finetuned_epoch5',
+    'llama3_8B_toxigen_vicuna_36_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_accuracy_36_False_0.0001_finetuned_epoch5',
+    'llama3_8B_toxigen_vicuna_36_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_0.0001_finetuned_epoch5',
+    'llama3_8B_toxigen_vicuna_18_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_accuracy_18_False_0.0001_finetuned_epoch5',
+    'llama3_8B_toxigen_vicuna_18_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_18_True_0.0001_finetuned_epoch5',
+    'llama3_8B_hate_vicuna_18_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_hate_vicuna_accuracy_18_False_0.0001_finetuned_epoch5',
+    'llama3_8B_hate_vicuna_18_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_hate_vicuna_logpns_18_True_0.0001_finetuned_epoch5',
+    'llama3_8B_hate_vicuna_36_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_hate_vicuna_accuracy_36_False_0.0001_finetuned_epoch5',
+    'llama3_8B_hate_vicuna_36_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_hate_vicuna_logpns_36_True_0.0001_finetuned_epoch5',
+    'mistral_7B': 'mistralai/Mistral-7B-v0.1',
+    'vicuna_13B_hate_vicuna_36_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_hate_vicuna_accuracy_36_False_0.0001_finetuned_epoch5',
+    'vicuna_13B_hate_vicuna_36_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_hate_vicuna_logpns_36_True_0.0001_finetuned_epoch5',  
+    'vicuna_13B_hate_vicuna_18_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_hate_vicuna_accuracy_18_False_0.0001_finetuned_epoch5',
+    'vicuna_13B_hate_vicuna_18_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_hate_vicuna_logpns_18_True_0.0001_finetuned_epoch5',  
+    'llama3_8B_toxigen_vicuna_logpns_36_True_0.0001_finetuned_bce_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_0.0001_finetuned_bce_epoch5',
+    'llama3_8B_toxigen_vicuna_logpns_36_True_0.0001_finetuned_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_0.0001_finetuned_epoch5',
+    'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_epoch5',
+    'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_l2_finetuned_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_l2_finetuned_epoch5',
+    'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_False_0.05_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_False_0.05_epoch5',
+    'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_epoch5',
+    'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_True_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_True_epoch5',
+    'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_True_0.001_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_True_0.001_epoch5',
+    'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_useKL_True_0.05_epoch5': '/work/hdd/bcxt/yian3/toxic/models/tox_par/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_useKL_True_0.05_epoch5',
 }
 
 from TruthfulQA.truthfulqa.utilities import (
@@ -243,8 +382,7 @@ def get_all_mu(vae, data_tensor, batch_size=256, device='cuda'):
 
 
 def train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=1, h_dim1=128, h_dim2=64,
-                              batch_size=128, lr=1e-3, vae_epochs=20, dataset_name=None, model_name=None, device='cuda'):
-    # Flatten if needed
+                              batch_size=128, lr=1e-3, vae_epochs=20, dataset_name=None, model_name=None, mode='finetune', device='cuda'):
     print("LENGTH OF HEADWISE ACTIVATIONS", len(head_wise_activations))
     split = int(0.8 * len(head_wise_activations))
     train_raw = head_wise_activations[:split]
@@ -255,6 +393,7 @@ def train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=1, 
     label_val_raw = labels[split:]
     y_train = torch.tensor(label_train_raw, dtype=torch.float32)
     y_val = torch.tensor(label_val_raw, dtype=torch.float32)
+    print("done reading data")
     # Dataloaders
     train_loader = DataLoader(TensorDataset(all_X_train), batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(TensorDataset(all_X_val), batch_size=batch_size, shuffle=False)
@@ -295,7 +434,8 @@ def train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=1, 
     c_all = torch.cat([train_mu, val_mu], dim=0)  # shape: [N_total, z_dim]
     acc, f1 = evaluate_latent_mu(train_mu, y_train, val_mu, y_val)
     print("c_all size", c_all.size(), model_name)
-    torch.save(c_all, f"/work/hdd/bcxt/yian3/toxic/features/{model_name}_{dataset_name}_c_all.pt")
+    if mode == 'valid':
+        torch.save(c_all, f"/work/hdd/bcxt/yian3/toxic/features/{model_name}_{dataset_name}_c_all.pt")
     return train_mu, val_mu, c_all
 
 def evaluate_latent_mu(train_mu, y_train, val_mu, y_val, seed=42):
@@ -324,13 +464,11 @@ def intervention_fn(head_output, layer_name, start_edit_location='lt', prompt_en
     # This is a basic implementation - customize based on your needs
     return head_output
 
-"""questions = tqa_run_answers(questions, ENGINE_MAP[mdl], mdl, preset, model=llama_model, tokenizer=llama_tokenizer,
-                device=device, cache_dir=cache_dir, verbose=verbose,
-                interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
-"""
+
 def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verbose=True, device=None, cache_dir=None, interventions={}, intervention_fn=None, instruction_prompt=True, many_shot_prefix=None, use_special_direction=False):
 
     """Stores answers from autoregressive HF models (GPT-2, GPT-Neo)"""
+
     if tag not in frame.columns:
         frame[tag] = ''
 
@@ -338,33 +476,25 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
     frame[tag] = frame[tag].astype(str)
 
     # get tokens for ending sequence
-    # seq_start = np.array(tokenizer('A:')['input_ids'])
-    # seq_end = np.array(tokenizer('Q:')['input_ids'])
-    print("total questions", len(frame))
+    seq_start = np.array(tokenizer('A:')['input_ids'])
+    seq_end = np.array(tokenizer('Q:')['input_ids'])
+
     tokens = []
     for idx in frame.index: 
         if pd.isnull(frame.loc[idx, tag]) or not len(frame.loc[idx, tag]):
-            # print("PRESET", preset)
-            prompt = format_prompt(frame.loc[idx], preset, format='none') #frame.loc[idx,'text']# 
+            prompt = format_prompt(frame.loc[idx], preset, format='none')
             if use_special_direction:
                 prompt_encoding = sentence_embedding.encode(frame.loc[idx, 'text'])
             else:
                 prompt_encoding = None
             prefix = ''
             if instruction_prompt:  # from Ouyang et al. (2022) Figure 17, followed by LLaMA evaluation, and then followed by us
-                # prefix += 'Please rewrite the following sentence so that it is not toxic has similar meaning but is not toxic:' # + '\n\n'
-                # prefix += f"""Paraphrase the following sentence in a polite and completely non-toxic way and don't generate any irrelevant contents:
-                
-                # Original text: "{prompt}"
-                
-                # Paraphrase: """ 
-                prefix += f"""Please continue the following sentence: "{prompt}" """
+                prefix += """Please continue the following sentence: """
             if many_shot_prefix is not None:
                 prefix += many_shot_prefix + '\n\n'
-            prompt = prefix # + prompt  
+            prompt = prefix + prompt            
             input_ids = tokenizer(prompt, return_tensors='pt').input_ids
             tokens.append(input_ids)
-    
 
     # --- intervention code --- #
     def id(head_output, layer_name): 
@@ -382,26 +512,22 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
     with torch.no_grad():
         for idx, input_ids in enumerate(tqdm(tokens)):
             max_len = input_ids.shape[-1] + 50
-            # print("IDX", idx)
+
             # --- intervention code --- #
+
             with TraceDict(model, layers_to_intervene, edit_output=intervene) as ret: 
-                input_ids = input_ids.to(model.device)
-
-                # model = model.to(torch.float32)
-                model_gen_tokens = model.generate(input_ids, top_k=10, max_length=max_len, num_return_sequences=1,min_new_tokens=20, do_sample=True)[:, input_ids.shape[-1]:]
-
+                input_ids = input_ids.to(device)
+                model_gen_tokens = model.generate(input_ids, top_k=10, max_length=max_len, num_return_sequences=1,
+                                                    min_new_tokens=20, do_sample=True, temperature=0.7)[:, input_ids.shape[-1]:]
+            
             model_gen_str = tokenizer.decode(model_gen_tokens[0], skip_special_tokens=True)
             model_gen_str = model_gen_str.strip()
-            clean_ids = [t for t in model_gen_tokens[0].tolist() if t != tokenizer.pad_token_id]
-            decoded = tokenizer.decode(clean_ids, skip_special_tokens=True)
+
 
             if verbose: 
                 print("MODEL_OUTPUT: ", model_gen_str)
             
             frame.loc[idx, tag] = model_gen_str
-            if not model_gen_str: 
-                print("broke")
-                break
             sequences.append(model_gen_str)
 
             # --- intervention code --- #
@@ -409,7 +535,7 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
     if device:
         torch.cuda.empty_cache()
 
-    return frame, sequences
+    return frame
 
 def tqa_run_probs(frame, engine, tag, preset, model=None, tokenizer=None, verbose=True, device=None, cache_dir=None, interventions={}, intervention_fn=None, instruction_prompt=True, many_shot_prefix=None, use_special_direction=False):
 
@@ -649,7 +775,7 @@ def run_kl_wrt_orig(model_key, model=None, tokenizer=None, device='cuda', interv
 
     return np.mean(kl_divs)
 
-def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path, device='cpu', verbose=False, preset='qa', interventions={}, intervention_fn=None, cache_dir=None, separate_kl_device=None, instruction_prompt=True, many_shot_prefix=None, judge_name=None, info_name=None, use_special_direction=False): 
+def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path, device='cpu', verbose=False, preset='toxic', interventions={}, local_interventions={}, intervention_fn=None, cache_dir=None, separate_kl_device=None, instruction_prompt=True, many_shot_prefix=None, judge_name=None, info_name=None, use_special_direction=False, local_builder=None, context_k=64, max_examples=None): 
     """
     Inputs:
     models: a dictionary of the form {model_name: model} where model is a HF transformer # TODO: doesn't work with models other than llama right now
@@ -664,6 +790,10 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
     """
 
     questions = utilities.load_questions(filename=input_path)
+    # Limit questions if max_examples is specified
+    if max_examples and len(questions) > max_examples:
+        print(f"Limiting questions to {max_examples} examples for faster testing")
+        questions = questions.head(max_examples)
     print("ASSUMES OPENAI_API_KEY ENVIRONMENT VARIABLE IS SET")
     openai.api_key = os.environ.get('OPENAI_API_KEY')
     
@@ -691,12 +821,13 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
             except Exception as err:
                 print(err)
 
+        
         # llama
-        if mdl in ['llama_1B', 'llama_3B', 'llama_7B', 'alpaca_7B', 'vicuna_13B', 'vicuna_pns', 'COV_pns', 'COV_pns_use_pns', 'llama2_chat_7B', 'llama2_chat_13B', 'llama2_chat_70B']: 
-
+        #if mdl in ['llama_1B', 'llama_3B', 'llama_7B', 'alpaca_7B', 'vicuna_13B', 'vicuna_pns', 'COV_pns', 'COV_pns_use_pns', 'llama2_chat_7B', 'llama2_chat_13B', 'llama2_chat_70B']: 
+        if ('llama' in mdl or 'pns' in mdl or 'vicuna' in mdl or 'COV' in mdl or 'mistral' in mdl) and 'gemma' not in mdl:
             assert models[mdl] is not None, 'must provide llama model'
             llama_model = models[mdl]
-            if mdl == 'llama_1B' or mdl == 'llama_3B' or mdl == 'vicuna_13B' or mdl == 'vicuna_pns' or mdl == 'COV_pns' or mdl == 'COV_pns_use_pns':
+            if mdl == 'llama_1B' or mdl == 'llama_3B' or 'llama' in mdl or mdl == 'vicuna_13B' or mdl == 'vicuna_pns' or mdl == 'COV_pns' or mdl == 'COV_pns_use_pns' or mdl == 'mistral_7B':
                 llama_tokenizer = AutoTokenizer.from_pretrained(ENGINE_MAP[mdl], load_in_8bit=True,)
             else:
                 llama_tokenizer = LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
@@ -704,9 +835,11 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
             
             if 'judge' in metric_names or 'info' in metric_names: 
                 print("TRUE judge")
-                questions, sequences = tqa_run_answers(questions, ENGINE_MAP[mdl], mdl, preset, model=llama_model, tokenizer=llama_tokenizer,
+                questions = tqa_run_answers(questions, ENGINE_MAP[mdl], mdl, preset, model=llama_model, tokenizer=llama_tokenizer,
                                 device=device, cache_dir=cache_dir, verbose=verbose,
-                                interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
+                                interventions=interventions, intervention_fn=intervention_fn, 
+                                instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, 
+                                use_special_direction=use_special_direction)
             print("JUDGE INFO length", len(questions))
             utilities.save_questions(questions, output_path)
 
@@ -801,6 +934,9 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
         if 'llama' in model_key or 'alpaca' in model_key or 'vicuna' or 'pns' in model_key:
             ce_loss = run_ce_loss(model_key, model=llama_model, tokenizer=llama_tokenizer, device=device, interventions=interventions, intervention_fn=intervention_fn, use_special_direction=use_special_direction)
             kl_wrt_orig = run_kl_wrt_orig(model_key, model=llama_model, tokenizer=llama_tokenizer, device=device, interventions=interventions, intervention_fn=intervention_fn, separate_kl_device=separate_kl_device, use_special_direction=use_special_direction)
+        elif 'gemma3' in model_key:
+            ce_loss = 0
+            kl_wrt_orig = 0
 
         results.loc[model_key, 'CE Loss'] = ce_loss
         results.loc[model_key, 'KL wrt Orig'] = kl_wrt_orig
@@ -823,19 +959,30 @@ def train_probes(seed, train_set_idxs, val_set_idxs, separated_head_wise_activat
     probes = []
 
     all_X_train = np.concatenate([separated_head_wise_activations[i] for i in train_set_idxs], axis = 0)
-    all_X_val = np.concatenate([separated_head_wise_activations[i] for i in val_set_idxs], axis = 0)
+    if val_set_idxs is not None and len(val_set_idxs) > 0:
+        all_X_val = np.concatenate([separated_head_wise_activations[i] for i in val_set_idxs], axis = 0)
+        y_val = np.concatenate([separated_labels[i] for i in val_set_idxs], axis = 0)
+    else:
+        all_X_val = None
+        y_val = None
     y_train = np.concatenate([separated_labels[i] for i in train_set_idxs], axis = 0)
-    y_val = np.concatenate([separated_labels[i] for i in val_set_idxs], axis = 0)
     # print("==========SLICE=========", all_X_train.shape)
     for layer in tqdm(range(num_layers)): 
         for head in range(num_heads): 
             X_train = all_X_train[:,layer,head,:]
-            X_val = all_X_val[:,layer,head,:]
+            if all_X_val is not None:
+                X_val = all_X_val[:,layer,head,:]
+            else:
+                X_val = None
     
             clf = LogisticRegression(random_state=seed, max_iter=1000).fit(X_train, y_train)
             y_pred = clf.predict(X_train)
-            y_val_pred = clf.predict(X_val)
-            all_head_accs.append(accuracy_score(y_val, y_val_pred))
+            if X_val is not None and y_val is not None:
+                y_val_pred = clf.predict(X_val)
+                all_head_accs.append(accuracy_score(y_val, y_val_pred))
+            else:
+                # Use training accuracy when no validation set
+                all_head_accs.append(accuracy_score(y_train, y_pred))
             probes.append(clf)
 
     all_head_accs_np = np.array(all_head_accs)
@@ -859,21 +1006,28 @@ def get_top_heads(train_idxs, val_idxs, separated_activations, separated_labels,
 
 def get_top_heads_pns(train_idxs, val_idxs, separated_head_wise_activations,  # shape: [N, L, H, D]
     separated_labels, separated_head_wise_c, num_layers, num_heads, num_to_intervene=10, lambda_reg=1e-4, sigma_sq=1.0, seed=42, use_random_dir=False):
-
+    print(len(separated_head_wise_activations))
     all_X_train = np.concatenate([separated_head_wise_activations[i] for i in train_idxs], axis = 0)
-    all_X_val = np.concatenate([separated_head_wise_activations[i] for i in val_idxs], axis = 0)
-
     c_train = torch.stack([x for i in train_idxs for x in separated_head_wise_c[i]])  # shape [2 * len(train_idxs), z_dim]
-    c_val = torch.stack([x for i in val_idxs for x in separated_head_wise_c[i]])
     y_train = np.concatenate([separated_labels[i] for i in train_idxs], axis = 0)
-    y_val = np.concatenate([separated_labels[i] for i in val_idxs], axis = 0)
-
-    all_X = np.concatenate([all_X_train, all_X_val], axis=0)
-    y_all = np.concatenate([y_train, y_val], axis=0)
+    
+    # Handle case where val_idxs is None or empty
+    if val_idxs is None or len(val_idxs) == 0:
+        print("Warning: val_idxs is None or empty. Using only training data.")
+        all_X = all_X_train
+        y_all = y_train
+        c_all = c_train
+    else:
+        all_X_val = np.concatenate([separated_head_wise_activations[i] for i in val_idxs], axis = 0)
+        c_val = torch.stack([x for i in val_idxs for x in separated_head_wise_c[i]])
+        y_val = np.concatenate([separated_labels[i] for i in val_idxs], axis = 0)
+        
+        all_X = np.concatenate([all_X_train, all_X_val], axis=0)
+        y_all = np.concatenate([y_train, y_val], axis=0)
+        c_all = torch.cat([c_train, c_val], dim=0)
 
     all_X = torch.tensor(all_X, dtype=torch.float32)       # [N_total, L, H, D]
     y_all = torch.tensor(y_all, dtype=torch.float32).unsqueeze(1)  # [N_total, 1]
-    c_all = torch.cat([c_train, c_val], dim=0)
 
 
     N, L, H, D = all_X.shape
@@ -973,10 +1127,8 @@ def get_interventions_dict(top_heads, probes, tuning_activations, num_heads, use
         activations = tuning_activations[:,layer,head,:] # batch x 128
         if use_mat_direction or use_special_direction:
             # print("batch activations shape", activations.shape) # batch x 128
-            # print("com_directions shape", com_directions.shape) # 1024 x 128 x 128
             direction = com_directions[layer_head_to_flattened_idx(layer, head, num_heads)] # 128 x 128
             # print("mat_direction shape", direction.shape) # 128 x 128
-
             proj_val_std = None
             # proj_vals = activations @ direction.T # batch x 128
             # proj_val_std = np.std(proj_vals, axis=0).reshape(1, -1) # 1 x 128
@@ -1060,8 +1212,19 @@ def get_separated_activations(labels, head_wise_activations, categories, dataset
 
     return grouped_activations, grouped_labels, idxs_to_split_at
 
-def get_activations(labels, head_wise_activations, head_wise_c, dataset, model_name): 
-    sentences = pd.read_csv(f'./TruthfulQA/{dataset}.csv')
+def get_activations(labels, head_wise_activations, head_wise_c, dataset, model_name, alpha): 
+    if dataset == 'hate_vicuna':
+        hate_path = f'/work/hdd/bcxt/yian3/toxic/features/{dataset}_texts.json'
+        with open(hate_path) as f:
+            data = [json.loads(line) for line in f]
+        sentences = pd.DataFrame(data)
+    elif dataset == 'paradetox':
+        paradetox_path = f'/work/hdd/bcxt/yian3/toxic/features/{dataset}_texts.json'
+        with open(paradetox_path, 'r') as f:
+            data = json.load(f)
+        sentences = pd.DataFrame(data)
+    else:
+        sentences = pd.read_csv(f'./TruthfulQA/{dataset}.csv')
     texts = sentences["text"]
     toxic_texts = sentences["toxic_text"]
     non_toxic_texts = sentences["non_toxic_text"]
@@ -1111,7 +1274,12 @@ def get_com_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, sepa
     return com_directions
 
 def get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, df): 
-    usable_idxs = np.concatenate([train_set_idxs, val_set_idxs], axis=0)
+    # Handle case where val_set_idxs is None or empty
+    if val_set_idxs is None or len(val_set_idxs) == 0:
+        print("Warning: val_set_idxs is None or empty. Using only training data.")
+        usable_idxs = train_set_idxs
+    else:
+        usable_idxs = np.concatenate([train_set_idxs, val_set_idxs], axis=0)
     usable_labels = [separated_labels[i] for i in usable_idxs]
     all_prompt_encodings = [sentence_embedding.encode(df.loc[idx, 'text']) for idx in usable_idxs]
     
@@ -1135,10 +1303,9 @@ def get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, 
                     print("layer, head, i:", layer, head, i, cur_usable_labels)
                     break
             direction = direction / np.linalg.norm(direction, axis=1).reshape(-1, 1)
-            # print("direction", direction.shape)
             sp_directions.append(direction)
     sp_directions = np.array(sp_directions)
-    print("direction", sp_directions.shape)
+    print("DIRECTION SHAPE", sp_directions.shape)
     if np.isnan(sp_directions).any() or np.isinf(sp_directions).any():
         print(f"[SKIP] NaN direction in layer {layer} head {head}")
         direction = np.zeros_like(direction)

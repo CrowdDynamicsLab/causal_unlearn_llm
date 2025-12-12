@@ -1,4 +1,6 @@
+import copy
 import torch
+from collections import defaultdict
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from datasets import load_dataset
@@ -49,6 +51,7 @@ HF_NAMES = {
     'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
 }
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Fine-tune language model with log-PNS objective')
     
@@ -61,15 +64,21 @@ def parse_args():
                       help='Path to toxic dataset')
     parser.add_argument('--nontoxic_path', type=str, default="./dataset/vicuna-13b_nontoxic.json",
                       help='Path to non-toxic dataset')
+    parser.add_argument('--seed', type=int, default=2,
+                      help='Seed for random number generator')
     # Training hyperparameters
     parser.add_argument('--lambda_reg', type=float, default=1e-2,
                       help='Regularization strength')
-    parser.add_argument('--epochs', type=int, default=5,
+    parser.add_argument('--epochs', type=int, default=1,
                       help='Number of training epochs')
     parser.add_argument('--batch_size', type=int, default=1,
                       help='Batch size for training')
-    parser.add_argument('--lr', type=float, default=1e-4,
+    parser.add_argument('--lr', type=float, default=1e-5,
                       help='Learning rate')
+    parser.add_argument('--lambda_term2', type=float, default=1e-3,
+                      help='Regularization strength for term 2')
+    parser.add_argument('--lambda_cls', type=float, default=0.1,
+                      help='Weight for classification loss term')
     parser.add_argument('--max_length', type=int, default=10,
                       help='Maximum sequence length')
     parser.add_argument('--virtual_batch_size', type=int, default=128,
@@ -81,14 +90,107 @@ def parse_args():
     parser.add_argument('--num_heads', type=int, default=18,
                       help='Number of heads to select')
     parser.add_argument('--heads_path', type=str, 
-                      default="./features/True_vicuna_13B_toxigen_vicuna_seed_2_top_36_heads_alpha_5.0_fold_0_top_heads.npy",
+                      default="/work/hdd/bcxt/yian3/toxic/features/heads/True_vicuna_13B_toxigen_vicuna_seed_2_top_36_heads_alpha_5.0_fold_0_top_heads.npy",
                       help='Path to selected heads numpy file')
-    
+    parser.add_argument('--alpha', type=float, default=5.0,
+                      help='Alpha for logPNS')
+    parser.add_argument('--use_pns', action='store_true', default=False)
+    parser.add_argument('--use_l2', action='store_true', default=False,
+                      help='Use L2 regularization on model weights')
+    parser.add_argument('--l2_lambda', type=float, default=1e-4,
+                      help='L2 regularization strength')
     parser.add_argument('--save_dir', type=str, 
                       default="/work/hdd/bcxt/yian3/toxic/models",
                       help='Directory to save model checkpoints')
-    
+    parser.add_argument('--use_kl', action='store_true', default=False,
+                      help='Use KL divergence loss with teacher model')
+    parser.add_argument('--lambda_fm', type=float, default=0.05,
+                      help='Lambda for feature matching loss (default: 0.05)')
     return parser.parse_args()
+
+
+def _pick_fm_layers(model, selected_heads, args):
+    # Priority: args.fm_layers (list of ints), else layers referenced by selected_heads, else a few defaults
+    if hasattr(args, "fm_layers") and args.fm_layers:
+        return list(args.fm_layers)
+    # selected_heads can be a numpy array; avoid ambiguous truth-value errors
+    if selected_heads is not None and len(selected_heads) > 0:
+        return sorted({L for (L, _) in selected_heads})
+    L = len(model.model.layers)
+    return [L//3, 2*L//3, L-1]  # fallback: early/mid/late
+
+
+def _layernorm_lastdim(x):
+    return F.layer_norm(x, x.shape[-1:])
+
+
+def calculate_l2_loss(model, selected_heads, l2_lambda):
+    """Calculate L2 regularization loss for selected model parameters."""
+    l2_loss = 0.0
+    for (layer_idx, head_idx) in selected_heads:
+        o_proj = model.model.layers[layer_idx].self_attn.o_proj
+        if o_proj.weight is not None and o_proj.weight.requires_grad:
+            l2_loss += torch.norm(o_proj.weight, p=2) ** 2
+        if o_proj.bias is not None and o_proj.bias.requires_grad:
+            l2_loss += torch.norm(o_proj.bias, p=2) ** 2
+    return l2_lambda * l2_loss
+
+
+def head_only_feature_loss(
+    student_model,
+    teacher_model,
+    fwd_inp_s,                     # dict: layer_idx -> (B, T, D) or (B, D)
+    fwd_inp_t,                     # dict: layer_idx -> (B, T, D) or (B, D)
+    selected_pairs,                # list of (layer_idx, head_idx)
+    attention_mask=None,           # (B, T) or None
+    take_last=True,                # mimic your current last-token behavior
+    normalize="layernorm",         # or None
+    metric="l2"                    # or "cos"
+):
+    losses = []
+    H = student_model.config.hidden_size
+    nH = student_model.config.num_attention_heads
+    dH = H // nH
+
+    for (L, h) in selected_pairs:
+        # Inputs to o_proj (concat of per-head outputs), student & teacher
+        Xs = fwd_inp_s[L]     # (B,T,H) or (B,H)
+        Xt = fwd_inp_t[L]     # (B,T,H) or (B,H)
+
+        # match your current reduction to last token
+        if Xs.dim() == 3 and take_last:
+            Xs = Xs[:, -1, :]         # (B,H)
+            Xt = Xt[:, -1, :]
+
+        # slice the head's chunk from the o_proj INPUT (pre-mix)
+        start, end = h * dH, (h + 1) * dH
+        hs = Xs[..., start:end].to(torch.float32)   # (B,dH)
+        ht = Xt[..., start:end].to(torch.float32)
+
+        # head's contribution through W_O columns [ :, start:end ]
+        Wo_s = student_model.model.layers[L].self_attn.o_proj.weight[:, start:end].to(torch.float32)  # (H,dH)
+        Wo_t = teacher_model.model.layers[L].self_attn.o_proj.weight[:, start:end].to(torch.float32)  # (H,dH)
+
+        ys = hs @ Wo_s.T    # (B,H)
+        yt = ht @ Wo_t.T    # (B,H)
+
+        if normalize == "layernorm":
+            ys = F.layer_norm(ys, ys.shape[-1:])
+            yt = F.layer_norm(yt, yt.shape[-1:])
+
+        if metric == "cos":
+            per = 1.0 - F.cosine_similarity(ys, yt, dim=-1, eps=1e-8)  # (B,)
+        else:  # "l2"
+            per = (ys - yt).pow(2).mean(dim=-1)                        # (B,)
+
+        # token masking (only relevant if you didn't reduce to last token)
+        if attention_mask is not None and Xs.dim() == 3 and not take_last:
+            m = attention_mask.float()
+            per = (per * m).sum(1) / (m.sum(1) + 1e-8)
+
+        losses.append(per.mean())
+
+    return torch.stack(losses).mean() if losses else torch.tensor(0.0, device=Wo_s.device)
 
 
 def train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=1, h_dim1=128, h_dim2=64,
@@ -141,86 +243,6 @@ def train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=1, 
     return train_mu, val_mu, c_all, sigma_sq_estimate
 
 
-# def get_confounds_from_vae(model, dataloader, selected_heads, device, args):
-#     """
-#     Extracts all attention head activations from training data, trains VAE once, and returns
-#     the confounder matrix (C_all) and estimated reconstruction variance (sigma_sq).
-#     """
-#     model.eval()
-#     X_all, Y_all, indices_all = [], [], []
-
-#     forward_saved_inputs = {}
-
-#     def make_hook(layer_idx):
-#         def hook_fn(module, input, output):
-#             forward_saved_inputs[layer_idx] = input[0]
-#         return hook_fn
-
-#     for layer_idx in set(l for (l, _) in selected_heads):
-#         model.model.layers[layer_idx].self_attn.o_proj.register_forward_hook(make_hook(layer_idx))
-
-#     with torch.no_grad():
-#         for batch in tqdm(dataloader, desc="📥 Extracting Train Activations"):
-#             forward_saved_inputs.clear()
-
-#             input_ids = batch["input_ids"].to(device)
-#             attention_mask = batch["attention_mask"].to(device)
-#             labels = batch["label"]
-#             indices = batch["index"]
-
-#             input_embeds = model.get_input_embeddings()(input_ids)
-#             with torch.amp.autocast("cuda", dtype=torch.float16):
-#                 _ = model(inputs_embeds=input_embeds, attention_mask=attention_mask)
-
-#             head_acts = []
-#             for (layer_idx, head_idx) in selected_heads:
-#                 o_proj = model.model.layers[layer_idx].self_attn.o_proj
-#                 o_proj_input = forward_saved_inputs[layer_idx]
-
-#                 if o_proj_input.ndim == 3:
-#                     o_proj_input = o_proj_input[:, -1, :]
-
-#                 full_output = o_proj(o_proj_input.to(o_proj.weight.dtype))
-#                 head_dim = model.config.hidden_size // model.config.num_attention_heads
-#                 start = head_idx * head_dim
-#                 end = (head_idx + 1) * head_dim
-#                 head_acts.append(full_output[:, start:end])
-
-#             head_tensor = torch.stack(head_acts, dim=1)  # [B, K, D_head]
-#             head_flat = head_tensor.view(head_tensor.size(0), -1)  # [B, K*D_head]
-
-#             X_all.append(head_flat.cpu())
-#             Y_all.append(labels.cpu())
-#             indices_all.append(indices.cpu())
-
-#     # Concatenate across batches
-#     X_all = torch.cat(X_all, dim=0)
-#     Y_all = torch.cat(Y_all, dim=0)
-#     idx_all = torch.cat(indices_all, dim=0)
-
-#     # Ensure correct order by sorting by index
-#     sort_idx = torch.argsort(idx_all)
-#     X_all = X_all[sort_idx]
-#     Y_all = Y_all[sort_idx]
-
-#     # Train VAE once
-#     _, _, C_all, sigma_sq = train_vae_and_extract_mu(
-#         head_wise_activations=X_all,
-#         labels=Y_all,
-#         input_dim=X_all.shape[1],
-#         z_dim=32,
-#         h_dim1=128,
-#         h_dim2=64,
-#         dataset_name=args.dataset_name,
-#         model_name=args.model_name,
-#         device=device,
-#         args=args
-#     )
-
-#     return C_all.to(device), sigma_sq
-
-
-
 # --- DATASET PREP ---
 class ToxicDataset(Dataset):
     def __init__(self, toxic_path, nontoxic_path, tokenizer, max_len=64):
@@ -252,7 +274,10 @@ class ToxicDataset(Dataset):
 class ToxicDataset_paired(Dataset):
     def __init__(self, toxic_path, tokenizer, max_len=64):
         toxic_data = load_dataset("json", data_files=toxic_path)["train"]  # Get the train split
-
+        if "hate" in toxic_path:
+            first_half = toxic_data.select(range(0, len(toxic_data) // 5))
+            second_half = toxic_data.select(range(len(toxic_data) // 2, len(toxic_data)))
+            toxic_data = first_half
         texts = []
         labels = []
         for item in toxic_data:
@@ -457,9 +482,34 @@ def setup_dataloaders(dataset, args):
     return train_loader, eval_loader
 
 
+def attach_o_proj_input_hooks(model, store_dict, layers=None, with_grad=True):
+    """
+    Attaches forward hooks to each block's self_attn.o_proj to capture its *input*.
+    - store_dict: dict[int -> Tensor], keyed by layer index
+    - with_grad: True for student (keep graph), False for teacher (detach)
+    Returns a list of handles so you can remove() them later.
+    """
+    handles = []
+    L_total = len(model.model.layers)
+    target_layers = range(L_total) if layers is None else layers
+
+    def make_hook(layer_idx):
+        def hook(mod, inp, out):
+            x = inp[0]                      # input to o_proj, shape (B,T,H) or (B,H)
+            if not with_grad:
+                x = x.detach()
+            store_dict[layer_idx] = x       # store by layer index
+        return hook
+
+    for L in target_layers:
+        m = model.model.layers[L].self_attn.o_proj
+        h = m.register_forward_hook(make_hook(L))
+        handles.append(h)
+    return handles
+
 
 def train_model(model, train_loader, eval_loader, optimizer, selected_heads, params_to_update, 
-                device,forward_saved_inputs, args):
+                device, forward_saved_inputs, args, tokenizer):
     """Main training loop."""
     step = 0
     accumulated_samples = 0
@@ -470,9 +520,23 @@ def train_model(model, train_loader, eval_loader, optimizer, selected_heads, par
     X_buffer = []
     Y_buffer = []
     C_buffer = []
+    logits_buffer = []
     print("Training set size:", len(train_loader.dataset))
     print("Training batches:", len(train_loader))
+    if args.use_kl:
+        teacher_model = copy.deepcopy(model).to(device).eval()
+        for p in teacher_model.parameters():
+            p.requires_grad_(False)
 
+        teacher_forward_saved_inputs = defaultdict(lambda: None)
+        teacher_handles = attach_o_proj_input_hooks(
+            teacher_model, teacher_forward_saved_inputs, layers=None, with_grad=False
+        )
+        fm_layers = _pick_fm_layers(model, selected_heads, args)
+        lambda_fm = args.lambda_fm
+        fm_metric = getattr(args, "fm_metric", "cos")  # or "l2"
+        fm_stride = getattr(args, "fm_stride", 1)      # e.g., 2 or 4 if you want it faster
+    
     for epoch in range(args.epochs):
         for param in params_to_update:
             if torch.isnan(param).any():
@@ -496,9 +560,35 @@ def train_model(model, train_loader, eval_loader, optimizer, selected_heads, par
             labels = batch['label'].to(device).unsqueeze(1)
             indices = batch["index"].to(device)
             with torch.amp.autocast("cuda", dtype=torch.float16):
-                _ = model(inputs_embeds=input_embeds, attention_mask=attention_mask)
+                outputs = model(inputs_embeds=input_embeds, attention_mask=attention_mask, output_hidden_states=True)
+                logits = outputs.logits.squeeze(-1)
+            # --- Teacher forward (no grad) ---
+            if args.use_kl:
+                with torch.no_grad():
+                    t_out = teacher_model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
 
-                # --- Extract activations ---
+                # --- Cosine/L2 feature matching on LayerNorm'ed states ---
+                fm_loss_batch = head_only_feature_loss(
+                    student_model=model,
+                    teacher_model=teacher_model,
+                    fwd_inp_s=forward_saved_inputs,                 # your existing dict
+                    fwd_inp_t=teacher_forward_saved_inputs,         # add the same hooks for teacher
+                    selected_pairs=selected_heads,                  # normalized [(layer, head)] list
+                    attention_mask=attention_mask,
+                    take_last=True,                                 # matches your current use
+                    normalize="layernorm",
+                    metric="l2",
+                )
+
+                # --- Gradient accumulation for feature loss only ---
+                bs = input_ids.size(0)
+                if args.virtual_batch_size:
+                    scale = float(bs) / float(args.virtual_batch_size)  # average across the virtual batch
+                else:
+                    scale = 1.0
+
+                (lambda_fm * fm_loss_batch * scale).backward()
+
             head_acts = []
             for (layer_idx, head_idx) in selected_heads:
                 o_proj = model.model.layers[layer_idx].self_attn.o_proj.to(torch.float32)
@@ -524,6 +614,7 @@ def train_model(model, train_loader, eval_loader, optimizer, selected_heads, par
             X_buffer.append(head_flat)  # Detach and clone to preserve the computation graph
             Y_buffer.append((2 * labels - 1).view(-1))
             # C_buffer.append(C_train[indices])
+            logits_buffer.append(logits)
             accumulated_samples += head_flat.size(0)
 
             # Compute loss and step when virtual batch is ready
@@ -535,7 +626,7 @@ def train_model(model, train_loader, eval_loader, optimizer, selected_heads, par
                 Xc = torch.cat(X_buffer, dim=0)
                 Yc = torch.cat(Y_buffer, dim=0)
                 # Cc = torch.cat(C_buffer, dim=0)
-
+                logits_c = torch.cat(logits_buffer, dim=0)
                 Xc = Xc - Xc.mean(0, keepdim=True)
                 # Cc = Cc - Cc.mean(0, keepdim=True)
 
@@ -560,10 +651,6 @@ def train_model(model, train_loader, eval_loader, optimizer, selected_heads, par
                 sigma_sq = head_wise_c[3]
                 Cc = head_wise_c[2].detach().to(Xc.device)
                 # Cc = C_all[indices]
-
-                    
-
-
                 CtC = Cc.T @ Cc
                 CtY = Cc.T @ Yc.to(Cc.dtype)
                 CtC_f = CtC.to(torch.float32)
@@ -579,25 +666,29 @@ def train_model(model, train_loader, eval_loader, optimizer, selected_heads, par
                 term1 = (proj**2).sum()
                 term2 = 2 * conf_adj.sum()
                 # term2 = 0
-                logpns = (term1 + 0.01 * term2) / (2 * sigma_sq)
+                logpns = (term1 + args.lambda_term2 * term2) / (2 * sigma_sq)
+
+                # Combine logPNS loss with classification loss
+                lambda_cls = args.lambda_cls  # Weight for classification loss - you can make this a parameter
+                total_loss = logpns 
+                
+                # Add L2 regularization if enabled
+                if args.use_l2:
+                    l2_loss = calculate_l2_loss(model, selected_heads, args.l2_lambda)
+                    total_loss = total_loss + l2_loss
+                    print("L2 loss:", l2_loss.item())
+                
                 print("Term1:", term1)
                 print("Term2:", term2)
                 print("sigma_sq:", sigma_sq)
-                # logpns = term1/ (2*sigma_sq)
-                # print("term1.requires_grad:", term1.requires_grad)
-                # print("term2.requires_grad:", term2.requires_grad)
+                print("logPNS loss:", logpns.item())
+                # print("l2 loss loss:", fm_loss_batch.item())
+                print("Total loss:", total_loss.item())
 
 
-                loss = logpns
+                loss = total_loss
                 loss.backward()
                 optimizer.step()
-
-
-                # for param in params_to_update:
-                #     if torch.isnan(param).any():
-                #         print(f"NaNs in param {param.shape}")
-                #     if not param.grad.is_contiguous():
-                #         print(f"Non-contiguous gradient of {param.shape}")
                 optimizer.zero_grad()
                 
                 # for (layer_idx, head_idx) in selected_heads:
@@ -617,6 +708,7 @@ def train_model(model, train_loader, eval_loader, optimizer, selected_heads, par
                 X_buffer.clear()
                 Y_buffer.clear()
                 C_buffer.clear()
+                logits_buffer.clear()  # Add this line to clear logits_buffer
                 accumulated_samples = 0
 
                 if step % 50 == 0:
@@ -624,18 +716,8 @@ def train_model(model, train_loader, eval_loader, optimizer, selected_heads, par
                     # evaluate_model(model, eval_loader, selected_heads)
                     gc.collect()
                     torch.cuda.empty_cache()
-                    # Clear evaluation cache
                     
     progress_bar.close()
-
-
-    # Save model
-
-    # if not os.path.exists(args.save_dir):
-    #     os.makedirs(args.save_dir)
-    # save_path = f"{args.save_dir}/{args.model_name}_{args.dataset_name}_logpns_finetuned_epoch{args.epochs}_lr{args.lr}_bs{args.virtual_batch_size}_lambda{args.lambda_reg}.pt"
-    # torch.save(model.state_dict(), save_path)
-    # print(f"\n✅ {args.model_name} log-PNS fine-tuning complete.")
 
 
 def main():
@@ -644,7 +726,12 @@ def main():
     # --- CONFIG ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Load selected heads
-    selected_heads = np.load(args.heads_path)
+    args.heads_path = f"/work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_0_top_heads.npy"
+    if os.path.exists(args.heads_path):
+        selected_heads = np.load(args.heads_path)
+    else:
+        args.heads_path = f"/work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_72_heads_alpha_{args.alpha}_fold_0_top_heads.npy"
+        selected_heads = np.load(args.heads_path)
     selected_heads = selected_heads[:args.num_heads] if len(selected_heads) > args.num_heads else selected_heads
     model_name = HF_NAMES[args.model_name]
 
@@ -668,7 +755,7 @@ def main():
 
     # --- SETUP DATASET & DATALOADERS ---
     # dataset = ToxicDataset(args.toxic_path, args.nontoxic_path, tokenizer, max_len=args.max_length)
-    dataset = ToxicDataset_paired("/work/hdd/bcxt/yian3/toxic/features/vicuna_13B_toxigen_vicuna_texts.json", tokenizer, max_len=args.max_length)
+    dataset = ToxicDataset_paired(f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_texts.json", tokenizer, max_len=args.max_length)
     train_loader, eval_loader = setup_dataloaders(dataset, args)
 
     # --- TRAIN LOOP ---
@@ -681,7 +768,8 @@ def main():
         params_to_update=params_to_update,
         device=device,
         forward_saved_inputs=forward_saved_inputs,
-        args=args
+        args=args,
+        tokenizer=tokenizer
     )
 
 
@@ -698,7 +786,10 @@ def main():
         use_pns_head = 'True'
     else:
         use_pns_head = 'False'
-    output_dir = f"/work/hdd/bcxt/yian3/toxic/models/{args.model_name}_{args.dataset_name}_{args.head_select}_{args.num_heads}_{use_pns_head}_finetuned_epoch{args.epochs}_cov_0.01"
+    
+    # Include L2 regularization info in output directory name
+    l2_suffix = f"_l2{args.l2_lambda}" if args.use_l2 else ""
+    output_dir = f"/work/hdd/bcxt/yian3/toxic/models/{args.model_name}_{args.dataset_name}_{args.head_select}_{args.num_heads}_{use_pns_head}_{args.lr}_{args.lambda_term2}_finetuned{l2_suffix}_useKL_{args.use_kl}_{args.lambda_fm}_epoch{args.epochs}"
     model.save_pretrained(output_dir)
     tokenizer.save_pretrained(output_dir)
     
@@ -711,3 +802,81 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# def get_confounds_from_vae(model, dataloader, selected_heads, device, args):
+#     """
+#     Extracts all attention head activations from training data, trains VAE once, and returns
+#     the confounder matrix (C_all) and estimated reconstruction variance (sigma_sq).
+#     """
+#     model.eval()
+#     X_all, Y_all, indices_all = [], [], []
+
+#     forward_saved_inputs = {}
+
+#     def make_hook(layer_idx):
+#         def hook_fn(module, input, output):
+#             forward_saved_inputs[layer_idx] = input[0]
+#         return hook_fn
+
+#     for layer_idx in set(l for (l, _) in selected_heads):
+#         model.model.layers[layer_idx].self_attn.o_proj.register_forward_hook(make_hook(layer_idx))
+
+#     with torch.no_grad():
+#         for batch in tqdm(dataloader, desc="📥 Extracting Train Activations"):
+#             forward_saved_inputs.clear()
+
+#             input_ids = batch["input_ids"].to(device)
+#             attention_mask = batch["attention_mask"].to(device)
+#             labels = batch["label"]
+#             indices = batch["index"]
+
+#             input_embeds = model.get_input_embeddings()(input_ids)
+#             with torch.amp.autocast("cuda", dtype=torch.float16):
+#                 _ = model(inputs_embeds=input_embeds, attention_mask=attention_mask)
+
+#             head_acts = []
+#             for (layer_idx, head_idx) in selected_heads:
+#                 o_proj = model.model.layers[layer_idx].self_attn.o_proj
+#                 o_proj_input = forward_saved_inputs[layer_idx]
+
+#                 if o_proj_input.ndim == 3:
+#                     o_proj_input = o_proj_input[:, -1, :]
+
+#                 full_output = o_proj(o_proj_input.to(o_proj.weight.dtype))
+#                 head_dim = model.config.hidden_size // model.config.num_attention_heads
+#                 start = head_idx * head_dim
+#                 end = (head_idx + 1) * head_dim
+#                 head_acts.append(full_output[:, start:end])
+
+#             head_tensor = torch.stack(head_acts, dim=1)  # [B, K, D_head]
+#             head_flat = head_tensor.view(head_tensor.size(0), -1)  # [B, K*D_head]
+
+#             X_all.append(head_flat.cpu())
+#             Y_all.append(labels.cpu())
+#             indices_all.append(indices.cpu())
+
+#     # Concatenate across batches
+#     X_all = torch.cat(X_all, dim=0)
+#     Y_all = torch.cat(Y_all, dim=0)
+#     idx_all = torch.cat(indices_all, dim=0)
+
+#     # Ensure correct order by sorting by index
+#     sort_idx = torch.argsort(idx_all)
+#     X_all = X_all[sort_idx]
+#     Y_all = Y_all[sort_idx]
+
+#     # Train VAE once
+#     _, _, C_all, sigma_sq = train_vae_and_extract_mu(
+#         head_wise_activations=X_all,
+#         labels=Y_all,
+#         input_dim=X_all.shape[1],
+#         z_dim=32,
+#         h_dim1=128,
+#         h_dim2=64,
+#         dataset_name=args.dataset_name,
+#         model_name=args.model_name,
+#         device=device,
+#         args=args
+#     )
+
+#     return C_all.to(device), sigma_sq

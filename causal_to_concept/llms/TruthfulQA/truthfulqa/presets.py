@@ -321,7 +321,7 @@ A1: 1
 A2: A person can only die once.
 Same: yes"""
 
-TOXIC_PRIMER = """this statement indicates that black men are seen as savages or animals compared to white men,toxic,black
+TOXIC_PRIMER = """This statement indicates that black men are seen as savages or animals compared to white men,toxic,black
 
 as a result of this, they have been given the right to vote in the united states, which they use to vote for the democratic party,non-toxic,black
 

@@ -12,10 +12,11 @@ sys.path.append('../')
 # import llama
 import pickle
 import argparse
-from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM # , Gemma3ForCausalLM, Gemma3ForConditionalGeneration
+import torch
 
 # Specific pyvene imports
-from utils import get_llama_activations_pyvene, tokenized_tqa, tokenized_tqa_gen, tokenized_tqa_gen_end_q, tokenize_toxicity_dataset, get_gpt2_activations_pyvene, tokenize_toxigen
+from utils import get_llama_activations_pyvene, tokenized_tqa, tokenized_tqa_gen, tokenized_tqa_gen_end_q, tokenize_toxicity_dataset, get_gpt2_activations_pyvene, tokenize_toxigen, tokenize_paradetox
 from interveners import wrapper, Collector, ITI_Intervener
 import pyvene as pv
 
@@ -28,15 +29,50 @@ HF_NAMES = {
     'llama2_chat_7B': 'meta-llama/Llama-2-7b-chat-hf', 
     'llama2_chat_13B': 'meta-llama/Llama-2-13b-chat-hf', 
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
-    'llama3_8B': 'meta-llama/Meta-Llama-3-8B',
     'llama3_8B_instruct': 'meta-llama/Meta-Llama-3-8B-Instruct',
     'llama3_70B': 'meta-llama/Meta-Llama-3-70B',
     'llama3_70B_instruct': 'meta-llama/Meta-Llama-3-70B-Instruct',
+    'llama3_8B': 'meta-llama/Meta-Llama-3-8B',
+    'llama3_8B_toxigen_vicuna_72_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_accuracy_72_False_0.0001_finetuned_epoch5',
+    'llama3_8B_toxigen_vicuna_72_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_72_True_0.0001_finetuned_epoch5',
+    'llama3_8B_toxigen_vicuna_36_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_accuracy_36_False_0.0001_finetuned_epoch5',
+    'llama3_8B_toxigen_vicuna_36_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_0.0001_finetuned_epoch5',
+    'llama3_8B_toxigen_vicuna_18_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_accuracy_18_False_0.0001_finetuned_epoch5',
+    'llama3_8B_toxigen_vicuna_18_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_18_True_0.0001_finetuned_epoch5',
     'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
     'vicuna_pns': '/work/hdd/bcxt/yian3/models/vicuna_pns_finetuned',
     'COV_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_finetuned_epoch5',
     'COV_pns_use_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_True_finetuned_epoch5',
-}
+    'vicuna_13B_toxigen_vicuna_72_0.01_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_72_True_0.01_finetuned_epoch5',
+    'vicuna_13B_toxigen_vicuna_72_0.01_acc': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_accuracy_72_False_0.01_finetuned_epoch5',
+    'vicuna_13B_toxigen_vicuna_36_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_accuracy_36_False_0.0001_finetuned_epoch5',
+    'vicuna_13B_toxigen_vicuna_36_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_36_True_0.0001_finetuned_epoch5',
+    'vicuna_13B_toxigen_vicuna_18_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_accuracy_18_False_0.0001_finetuned_epoch5',
+    'vicuna_13B_toxigen_vicuna_18_0.01_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_True_0.01_finetuned_epoch5',
+    'vicuna_13B_toxigen_vicuna_18_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_True_0.0001_finetuned_epoch5',
+    'gemma3_4B': 'google/gemma-3-4b-it',
+    'mistral_7B': 'mistralai/Mistral-7B-v0.1',
+    'llama3_8B_hate_vicuna_18_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_hate_vicuna_accuracy_18_False_0.0001_finetuned_epoch5',
+    'llama3_8B_hate_vicuna_18_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_hate_vicuna_logpns_18_True_0.0001_finetuned_epoch5',
+    'llama3_8B_hate_vicuna_36_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_hate_vicuna_accuracy_36_False_0.0001_finetuned_epoch5',
+    'llama3_8B_hate_vicuna_36_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_hate_vicuna_logpns_36_True_0.0001_finetuned_epoch5',
+    'vicuna_13B_hate_vicuna_72_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_hate_vicuna_accuracy_72_False_0.0001_finetuned_epoch5',
+    'vicuna_13B_hate_vicuna_72_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_hate_vicuna_logpns_72_True_0.0001_finetuned_epoch5',  
+    'vicuna_13B_hate_vicuna_36_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_hate_vicuna_accuracy_36_False_0.0001_finetuned_epoch5',
+    'vicuna_13B_hate_vicuna_36_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_hate_vicuna_logpns_36_True_0.0001_finetuned_epoch5',  
+    'vicuna_13B_hate_vicuna_18_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_hate_vicuna_accuracy_18_False_0.0001_finetuned_epoch5',
+    'vicuna_13B_hate_vicuna_18_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_hate_vicuna_logpns_18_True_0.0001_finetuned_epoch5',  
+    'llama3_8B_toxigen_vicuna_logpns_36_True_0.0001_finetuned_bce_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_0.0001_finetuned_bce_epoch5',
+    'llama3_8B_toxigen_vicuna_logpns_36_True_0.0001_finetuned_l2_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_0.0001_finetuned_l2_epoch5',
+    'llama3_8B_toxigen_vicuna_logpns_36_True_0.0001_finetuned_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_0.0001_finetuned_epoch5',
+    'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_epoch5',
+    'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_l2_finetuned_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_l2_finetuned_epoch5',
+    'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_False_0.05_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_False_0.05_epoch5',
+    'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_epoch5',
+    'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_True_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_True_epoch5',
+    'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_True_0.001_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_True_0.001_epoch5',
+    'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_useKL_True_0.05_epoch5': '/work/hdd/bcxt/yian3/toxic/models/tox_par/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_useKL_True_0.05_epoch5',
+    }
 
 def main(): 
     """
@@ -51,11 +87,22 @@ def main():
     parser.add_argument('--dataset_name', type=str, default='tqa_mc2')
     parser.add_argument('--device', type=int, default=0)
     args = parser.parse_args()
-
+    print(args.model_name)
     model_name_or_path = HF_NAMES[args.model_prefix + args.model_name]
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
-    model = AutoModelForCausalLM.from_pretrained(model_name_or_path, low_cpu_mem_usage=True, torch_dtype=torch.float16, device_map="auto")
+    if args.model_name == "gemma3_4B":
+        model = Gemma3ForConditionalGeneration.from_pretrained(
+            args.model_name, device_map="auto"
+        ).eval()
+
+        processor = AutoProcessor.from_pretrained(args.model_name)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+        model = AutoModelForCausalLM.from_pretrained(model_name_or_path, low_cpu_mem_usage=True, torch_dtype=torch.float16, device_map="auto")
+    
+    # Set pad_token if not already set
+    if hasattr(tokenizer, 'pad_token') and tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     device = "cuda"
     if args.dataset_name == "toxigen":
         dataset = load_dataset("json", data_files="../../../dataset/toxiGen.json")["train"]
@@ -92,14 +139,13 @@ def main():
         dataset = load_dataset("json", data_files="../../../dataset/vicuna-13b_hate.json")["train"]
         dataset_non = load_dataset("json", data_files="../../../dataset/vicuna-13b_nonhate.json")["train"]
         formatter = tokenize_toxigen 
-        
-    elif args.dataset_name == "tqa_gen": 
-        dataset = load_dataset("truthfulqa/truthful_qa", 'generation')['validation']
-        formatter = tokenized_tqa_gen
-        
-    elif args.dataset_name == 'tqa_gen_end_q': 
-        dataset = load_dataset("truthfulqa/truthful_qa", 'generation')['validation']
-        formatter = tokenized_tqa_gen_end_q
+
+    elif args.dataset_name == "paradetox":
+        paradetox_path = f'/work/hdd/bcxt/yian3/toxic/features/paradetox_texts.json'
+        with open(paradetox_path, 'r') as f:
+            dataset = json.load(f)
+        formatter = tokenize_paradetox
+
         
     else: 
         raise ValueError("Invalid dataset name")
@@ -120,17 +166,32 @@ def main():
         with open(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_categories.pkl', 'wb') as f:
             pickle.dump(categories, f)
     elif args.dataset_name == "hate_vicuna" or args.dataset_name == "toxigen_vicuna": 
+        if args.dataset_name == "hate_vicuna":
+            dataset_non = None
         prompts, labels, texts = formatter(dataset, dataset_non, tokenizer)
-        with open(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_texts.json', 'w') as f:
-            for sentence in texts:
-                text = sentence[0]
-                toxic_text = sentence[1]
-                non_toxic_text = sentence[2]
-                json.dump({"text": text,
-                           "toxic_text": toxic_text,
-                           "non_toxic_text": non_toxic_text,
-                           }, f)
-                f.write("\n")
+        # length = len(texts)
+        # if args.dataset_name == "hate_vicuna":
+        #     half = int(length / 2)
+        #     prompts = prompts[: half * 2]
+        #     labels = labels[: half * 2]
+        #     texts = texts[: half]
+        output_path = f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_texts.json'
+        if not os.path.exists(output_path):
+            with open(output_path, 'w') as f:
+                for sentence in texts:
+                    text = sentence[0]
+                    toxic_text = sentence[1]
+                    non_toxic_text = sentence[2]
+                    json.dump({"text": text,
+                            "toxic_text": toxic_text,
+                            "non_toxic_text": non_toxic_text,
+                            }, f)
+                    f.write("\n")
+        print(len(labels), len(prompts), len(texts))
+    elif args.dataset_name == "paradetox": 
+        prompts, labels, texts = formatter(dataset, tokenizer)
+        
+        print(len(labels), len(prompts), len(texts))
     else: 
         prompts, labels = formatter(dataset, tokenizer)
 
@@ -154,7 +215,10 @@ def main():
     print("number of layers", model.config.num_hidden_layers, len(collectors))
     i = 0
     for prompt in tqdm(prompts):
-        layer_wise_activations, head_wise_activations, _ = get_llama_activations_pyvene(collected_model, collectors, prompt, device)
+        if args.model_name == "gemma3_4B":
+            layer_wise_activations, head_wise_activations, _ = get_gemma_activations_pyvene(collected_model, collectors, prompt, device)
+        else:
+            layer_wise_activations, head_wise_activations, _ = get_llama_activations_pyvene(collected_model, collectors, prompt, device)
         # print(i, prompt, layer_wise_activations.shape)
         all_layer_wise_activations.append(layer_wise_activations[:,-1,:].copy())
         all_head_wise_activations.append(head_wise_activations.copy())
@@ -163,11 +227,35 @@ def main():
     print("Saving labels")
     np.save(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_labels.npy', labels)
 
-    print("Saving layer wise activations")
-    np.save(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_layer_wise.npy', all_layer_wise_activations)
+    # print("Saving layer wise activations")
+    # np.save(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_layer_wise.npy', all_layer_wise_activations)
     
     print("Saving head wise activations")
-    np.save(f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy', all_head_wise_activations)
+    print(f"Number of samples: {len(all_head_wise_activations)}")
+    if len(all_head_wise_activations) > 0:
+        print(f"Sample shape: {all_head_wise_activations[0].shape}")
+    
+    output_path = f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_head_wise.npy'
+    print(f"Saving to {output_path}...")
+    
+    # Use memory-efficient saving only for paradetox dataset
+    if args.dataset_name == "paradetox":
+        # Save the list directly - np.save will automatically pickle it
+        # This is more memory efficient than converting to array first
+        # Clear any other references to free memory before saving
+        import gc
+        gc.collect()
+        
+        # Save directly - np.save handles Python lists by pickling them
+        with open(output_path, 'wb') as f:
+            np.save(f, all_head_wise_activations, allow_pickle=True)
+        
+        print("Successfully saved head wise activations (paradetox - memory efficient)")
+    else:
+        # Normal saving for other datasets
+        np.save(output_path, all_head_wise_activations)
+        print("Successfully saved head wise activations")
 
 if __name__ == '__main__':
     main()
+

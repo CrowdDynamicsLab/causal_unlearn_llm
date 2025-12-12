@@ -181,8 +181,10 @@ def run_UnifQA(frame, engine, tag, preset='qa', verbose=False, device=None, cach
         if pd.isnull(frame.loc[idx, tag]) or not len(frame.loc[idx, tag]):
             prompt = format_prompt(frame.loc[idx], preset, format='UQA')  # don't include question preset
             if prompt is not None:
-                input_ids = tokenizer(prompt, return_tensors='pt').input_ids.to(device)
-                output_ids = model.generate(input_ids, top_k=1)[0]
+                tokenized = tokenizer(prompt, return_tensors='pt')
+                input_ids = tokenized.input_ids.to(device)
+                attention_mask = tokenized.attention_mask.to(device)
+                output_ids = model.generate(input_ids, attention_mask=attention_mask, top_k=1)[0]
                 response = tokenizer.decode(output_ids, skip_special_tokens=True)
 
                 if verbose:
@@ -223,10 +225,12 @@ def run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verbose=
             if pd.isnull(frame.loc[idx, tag]) or not len(frame.loc[idx, tag]):
                 prompt = format_prompt(frame.loc[idx], preset, format='general')
 
-                input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
+                tokenized = tokenizer(prompt, return_tensors="pt")
+                input_ids = tokenized.input_ids.to(device)
+                attention_mask = tokenized.attention_mask.to(device)
                 max_len = input_ids.shape[-1] + 50
 
-                outputs = model.generate(input_ids, top_k=1, max_length=max_len, num_return_sequences=1,
+                outputs = model.generate(input_ids, attention_mask=attention_mask, top_k=1, max_length=max_len, num_return_sequences=1,
                                          output_scores=True)
                 sequences, scores = outputs.sequences, outputs.scores
 
@@ -384,10 +388,12 @@ def run_GPTJ(frame, tag, preset='qa', device=None, cache_dir=None, check_path=No
         if pd.isnull(frame.loc[idx, tag]) or not len(frame.loc[idx, tag]):
             prompt = format_prompt(frame.loc[idx], preset, format='general')
             if prompt is not None:
-                input_ids = tokenizer(prompt, return_tensors='pt').input_ids.to(device)
+                tokenized = tokenizer(prompt, return_tensors='pt')
+                input_ids = tokenized.input_ids.to(device)
+                attention_mask = tokenized.attention_mask.to(device)
                 max_len = input_ids.shape[-1] + 50
 
-                output_ids = model.generate(input_ids, top_k=1, max_length=max_len)[0]
+                output_ids = model.generate(input_ids, attention_mask=attention_mask, top_k=1, max_length=max_len)[0]
                 gen_sequences = output_ids[input_ids.shape[-1]:]
                 gen_arr = gen_sequences.cpu().numpy()
                 idx_start = find_subsequence(gen_arr, seq_start, start=True)

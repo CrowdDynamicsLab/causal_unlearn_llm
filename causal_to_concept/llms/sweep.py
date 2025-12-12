@@ -14,7 +14,7 @@ def get_activations():
 
 def get_top_heads():
     selection_methods = ['pns','accuracy']
-    datasets = ['toxigen_vicuna', 'hate_vicuna']
+    datasets = ['toxigen_vicuna', 'hate_vicuna'] ## yian: hate too large
     models = ['vicuna_13B', 'llama3_8B', 'llama_7B']
     mode = 'get_top_heads'
     num_heads = [18, 36, 72]
@@ -25,13 +25,13 @@ def get_top_heads():
                 for num_head in num_heads:
                     for alpha in alpha:
                         #python validate_2fold_toxic.py  vicuna_13b --num_heads 10 --alpha 5 --seed 2 --device 0 --num_fold 2 --use_special_direction
-                        subprocess.run(['python', 'validate_2fold_toxic.py', '--dataset', dataset, model, '--num_heads', num_head, '--alpha', alpha, '--seed', '0',
+                        subprocess.run(['python', 'validate_2fold_toxic.py', '--dataset_name', dataset, '--model_name', model, '--num_heads', num_head, '--alpha', alpha, '--seed', '0',
                                          '--device', '0', '--num_fold', '2', '--mode', mode, '--use_special_direction', f"{'--use_pns' if method == 'pns' else ''}"], 
                                     cwd='causal_to_concept/llms')
 
 def finetune_heads():
     datasets = ['toxigen_vicuna', 'hate_vicuna']
-    models = ['vicuna_13b', 'llama3-8b', 'llama-7b']
+    models = ['vicuna_13B', 'llama3_8B', 'llama_7B']
     num_heads = [18, 36, 72]
     for dataset in datasets:
         for model in models:
