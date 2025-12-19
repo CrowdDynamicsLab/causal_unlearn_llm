@@ -148,9 +148,8 @@ ENGINE_MAP = {
     'llama3_8B': 'meta-llama/Meta-Llama-3-8B',
     'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
     'gemma3_4B': 'google/gemma-3-4b-it',
-    'vicuna_pns': '/work/hdd/bcxt/yian3/models/vicuna_pns_finetuned',
-    'COV_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_finetuned_epoch5',
-    'COV_pns_use_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_True_finetuned_epoch5',
+    'mistral_7B_Instruct': 'mistralai/Mistral-7B-Instruct-v0.2',
+    'qwen_7B': 'Qwen/Qwen2.5-7B-Instruct',
     'vicuna_13B_toxigen_vicuna_18_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_accuracy_18_False_0.0001_finetuned_epoch5',
     'vicuna_13B_toxigen_vicuna_18_0.01_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_True_0.01_finetuned_epoch5',
     'vicuna_13B_toxigen_vicuna_18_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_True_0.0001_finetuned_epoch5',
@@ -384,16 +383,19 @@ def get_all_mu(vae, data_tensor, batch_size=256, device='cuda'):
 def train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=1, h_dim1=128, h_dim2=64,
                               batch_size=128, lr=1e-3, vae_epochs=20, dataset_name=None, model_name=None, mode='finetune', device='cuda'):
     print("LENGTH OF HEADWISE ACTIVATIONS", len(head_wise_activations))
+    
     split = int(0.8 * len(head_wise_activations))
     train_raw = head_wise_activations[:split]
     val_raw = head_wise_activations[split:]
+    
+    print(f"Converting to tensors: train shape {train_raw.shape}, val shape {val_raw.shape}, input_dim {input_dim}")
     all_X_train = torch.tensor(np.array(train_raw), dtype=torch.float32).view(-1, input_dim)
     all_X_val   = torch.tensor(np.array(val_raw), dtype=torch.float32).view(-1, input_dim)
     label_train_raw = labels[:split]
     label_val_raw = labels[split:]
     y_train = torch.tensor(label_train_raw, dtype=torch.float32)
     y_val = torch.tensor(label_val_raw, dtype=torch.float32)
-    print("done reading data")
+    print(f"done reading data - train tensor size: {all_X_train.shape}, memory: {all_X_train.element_size() * all_X_train.nelement() / (1024**3):.2f} GB")
     # Dataloaders
     train_loader = DataLoader(TensorDataset(all_X_train), batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(TensorDataset(all_X_val), batch_size=batch_size, shuffle=False)
@@ -718,7 +720,7 @@ def run_ce_loss(model_key, model=None, tokenizer=None, device='cuda', interventi
 
 def run_kl_wrt_orig(model_key, model=None, tokenizer=None, device='cuda', interventions={}, intervention_fn=None, num_samples=100, separate_kl_device=None, use_special_direction=False): 
 
-    assert 'llama' in model_key or 'alpaca' in model_key or 'vicuna' in model_key, 'model must be llama model'
+    assert 'llama' in model_key or 'alpaca' in model_key or 'vicuna' in model_key or 'mistral' in model_key.lower() or 'qwen' in model_key.lower(), 'model must be llama, mistral, or qwen model'
 
     # load owt text
     # note this is tokenized with llama tokenizer
@@ -736,10 +738,24 @@ def run_kl_wrt_orig(model_key, model=None, tokenizer=None, device='cuda', interv
 
     kl_divs = []
     rand_idxs = np.random.choice(len(owt), num_samples, replace=False).tolist()
-
+    
+    # Determine model path - check ENGINE_MAP first, then fall back to local path
+    if model_key in ENGINE_MAP:
+        model_path = ENGINE_MAP[model_key]
+    elif model_key in ['llama3_8B', 'vicuna_13B']:
+        if model_key == 'llama3_8B':
+            model_path = 'meta-llama/Meta-Llama-3-8B'
+        elif model_key == 'vicuna_13B':
+            model_path = 'lmsys/vicuna-13b-v1.5'
+    else:
+        model_path = '/work/hdd/bcxt/yian3/toxic/models/' + model_key
+    
     if separate_kl_device is not None: 
-        # orig_model = llama.LLaMAForCausalLM.from_pretrained(ENGINE_MAP[model_key], torch_dtype=torch.float16, low_cpu_mem_usage=True)
-        orig_model = LLaMAForCausalLM.from_pretrained(ENGINE_MAP[model_key], torch_dtype=torch.float16, low_cpu_mem_usage=True)
+        # Use AutoModelForCausalLM for Mistral and Qwen, LlamaForCausalLM for LLaMA models
+        if 'mistral' in model_key.lower() or 'qwen' in model_key.lower():
+            orig_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16, low_cpu_mem_usage=True)
+        else:
+            orig_model = LlamaForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16, low_cpu_mem_usage=True)
         
         orig_model.to('cuda')
 
@@ -796,8 +812,13 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
         questions = questions.head(max_examples)
     print("ASSUMES OPENAI_API_KEY ENVIRONMENT VARIABLE IS SET")
     openai.api_key = os.environ.get('OPENAI_API_KEY')
-    
     for mdl in models.keys(): 
+        if mdl in ['llama3_8B', 'mistral_7B_Instruct', 'mistral_7B', 'qwen_7B']:
+            model_path = ENGINE_MAP[mdl]
+        elif mdl in ['vicuna_13B']:
+            model_path = 'lmsys/vicuna-13b-v1.5'
+        else:
+            model_path = '/work/hdd/bcxt/yian3/toxic/models/' + mdl
         # gpt-3
         if mdl in ['ada', 'babbage', 'curie', 'davinci']:  # gpt-3 models
             try:
@@ -828,34 +849,32 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
             assert models[mdl] is not None, 'must provide llama model'
             llama_model = models[mdl]
             if mdl == 'llama_1B' or mdl == 'llama_3B' or 'llama' in mdl or mdl == 'vicuna_13B' or mdl == 'vicuna_pns' or mdl == 'COV_pns' or mdl == 'COV_pns_use_pns' or mdl == 'mistral_7B':
-                llama_tokenizer = AutoTokenizer.from_pretrained(ENGINE_MAP[mdl], load_in_8bit=True,)
+                llama_tokenizer = AutoTokenizer.from_pretrained(model_path, load_in_8bit=True,)
             else:
-                llama_tokenizer = LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
+                llama_tokenizer = LlamaTokenizer.from_pretrained(model_path)
             # llama_tokenizer = llama.LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
             
-            if 'judge' in metric_names or 'info' in metric_names: 
-                print("TRUE judge")
-                questions = tqa_run_answers(questions, ENGINE_MAP[mdl], mdl, preset, model=llama_model, tokenizer=llama_tokenizer,
-                                device=device, cache_dir=cache_dir, verbose=verbose,
-                                interventions=interventions, intervention_fn=intervention_fn, 
-                                instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, 
-                                use_special_direction=use_special_direction)
+            questions = tqa_run_answers(questions, model_path, mdl, preset, model=llama_model, tokenizer=llama_tokenizer,
+                            device=device, cache_dir=cache_dir, verbose=verbose,
+                            interventions=interventions, intervention_fn=intervention_fn, 
+                            instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, 
+                            use_special_direction=use_special_direction)
             print("JUDGE INFO length", len(questions))
             utilities.save_questions(questions, output_path)
 
             if 'mc' in metric_names:
                 print("TRUE")
-                questions = tqa_run_probs(questions, ENGINE_MAP[mdl], mdl, model=llama_model, tokenizer=llama_tokenizer, preset=preset, device=device, cache_dir=cache_dir, verbose=False, interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
+                questions = tqa_run_probs(questions, model_path, mdl, model=llama_model, tokenizer=llama_tokenizer, preset=preset, device=device, cache_dir=cache_dir, verbose=False, interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
                 utilities.save_questions(questions, output_path)
         
         # gpt-neo
         if mdl in ['neo-small', 'neo-med', 'neo-large']:
             try:
-                models.run_answers(questions, ENGINE_MAP[mdl], mdl, preset,
+                models.run_answers(questions, model_path, mdl, preset,
                                    device=device, cache_dir=cache_dir)
                 utilities.save_questions(questions, output_path)
                 if 'mc' in metric_names:
-                    models.run_probs(questions, ENGINE_MAP[mdl], mdl, preset=preset, device=device,
+                    models.run_probs(questions, model_path, mdl, preset=preset, device=device,
                                      cache_dir=cache_dir)
                     utilities.save_questions(questions, output_path)
             except Exception as err:
@@ -865,10 +884,10 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
         # unifiedqa
         if mdl in ['uqa-small', 'uqa-base', 'uqa-large', 'uqa-3b']:
             try:
-                models.run_UnifQA(questions, ENGINE_MAP[mdl], mdl, preset, device=device, cache_dir=cache_dir)
+                models.run_UnifQA(questions, model_path, mdl, preset, device=device, cache_dir=cache_dir)
                 utilities.save_questions(questions, output_path)
                 if 'mc' in metric_names:
-                    models.run_probs_T5(questions, ENGINE_MAP[mdl], mdl, preset, device=device, cache_dir=cache_dir)
+                    models.run_probs_T5(questions, model_path, mdl, preset, device=device, cache_dir=cache_dir)
                     utilities.save_questions(questions, output_path)
             except Exception as err:
                 print(err)
@@ -897,6 +916,18 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
                         utilities.save_questions(questions, output_path)
                     else:
                         questions = metrics.run_end2end_GPT3(model_key, 'GPT-info', info_name, questions, info=True)
+                        utilities.save_questions(questions, output_path)
+                except Exception as err:
+                    print(err)
+            elif metric in ['toxic', 'sense']:
+                try:
+                    if metric == 'toxic':
+                        print("==================RUNNING TOXIC==================")
+                        questions = metrics.run_toxicity_evaluation(model_key, questions) # metrics.run_toxicity_evaluation(model_key, questions, judge_name)
+                        utilities.save_questions(questions, output_path)
+                    else:
+                        print("==================RUNNING SENSE (FLUENCY)==================")
+                        questions = metrics.run_fluency_evaluation(model_key, questions) # metrics.run_fluency_evaluation(model_key, questions, info_name)
                         utilities.save_questions(questions, output_path)
                 except Exception as err:
                     print(err)
@@ -1218,6 +1249,11 @@ def get_activations(labels, head_wise_activations, head_wise_c, dataset, model_n
         with open(hate_path) as f:
             data = [json.loads(line) for line in f]
         sentences = pd.DataFrame(data)
+    elif dataset == 'toxigen_vicuna':
+        toxigen_path = f'/work/hdd/bcxt/yian3/toxic/features/{dataset}_texts.json'
+        with open(toxigen_path) as f:
+            data = [json.loads(line) for line in f]
+        sentences = pd.DataFrame(data)
     elif dataset == 'paradetox':
         paradetox_path = f'/work/hdd/bcxt/yian3/toxic/features/{dataset}_texts.json'
         with open(paradetox_path, 'r') as f:
@@ -1228,7 +1264,6 @@ def get_activations(labels, head_wise_activations, head_wise_c, dataset, model_n
     texts = sentences["text"]
     toxic_texts = sentences["toxic_text"]
     non_toxic_texts = sentences["non_toxic_text"]
-    
     print("SHAPES", len(labels), len(head_wise_activations), len(texts), len(head_wise_c))
     
     grouped_activations = []
@@ -1238,7 +1273,6 @@ def get_activations(labels, head_wise_activations, head_wise_c, dataset, model_n
     used_idxs = set()
     
     for i in range(0, len(labels), 2):
-        # print("i", i)
         group_acts = [head_wise_activations[i], head_wise_activations[i+1]]
         group_labels = [labels[i], labels[i+1]]
         group_cs = [head_wise_c[i], head_wise_c[i+1]]

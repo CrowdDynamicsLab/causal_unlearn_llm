@@ -9,7 +9,7 @@ import json
 import numpy as np
 import argparse
 from datasets import load_dataset
-from transformers import LlamaForCausalLM, LlamaTokenizer, AutoTokenizer
+from transformers import LlamaForCausalLM, LlamaTokenizer, AutoTokenizer, AutoModelForCausalLM
 # from transformers import GPT2LMHeadModel, Gemma3ForCausalLM, Gemma3ForConditionalGeneration, AutoProcessor
 from vae import VAE, vae_loss_function, train_vae, test_vae
 
@@ -55,6 +55,8 @@ HF_NAMES = {
     'llama3_8B_hate_vicuna_36_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_hate_vicuna_accuracy_36_False_0.0001_finetuned_epoch5',
     'llama3_8B_hate_vicuna_36_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_hate_vicuna_logpns_36_True_0.0001_finetuned_epoch5',
     'mistral_7B': 'mistralai/Mistral-7B-v0.1',
+    'mistral_7B_Instruct': 'mistralai/Mistral-7B-Instruct-v0.2',
+    'qwen_7B': 'Qwen/Qwen2.5-7B-Instruct',
     'vicuna_13B_hate_vicuna_36_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_hate_vicuna_accuracy_36_False_0.0001_finetuned_epoch5',
     'vicuna_13B_hate_vicuna_36_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_hate_vicuna_logpns_36_True_0.0001_finetuned_epoch5',  
     'vicuna_13B_hate_vicuna_18_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_hate_vicuna_accuracy_18_False_0.0001_finetuned_epoch5',
@@ -72,7 +74,7 @@ HF_NAMES = {
 
 def main(): 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str, default='llama_7B', choices=HF_NAMES.keys(), help='model name')
+    parser.add_argument("--model_name", type=str, default='llama_7B', help='model name')
     parser.add_argument("--model_dir", type=str, default=None, help='local directory with model data')
     parser.add_argument('--use_honest', action='store_true', help='use local editted version of the model', default=False)
     parser.add_argument('--mode', type=str, default='general', help='if get top heads or get activations')
@@ -80,7 +82,7 @@ def main():
     parser.add_argument('--activations_dataset', type=str, default='toxigen_vicuna', help='feature bank for calculating std along direction')
     parser.add_argument('--num_heads', type=int, default=48, help='K, number of top heads to intervene on')
     parser.add_argument('--heads_path', type=str, 
-                      default="/work/hdd/bcxt/yian3/toxic/features/heads/False_vicuna_13B_toxigen_vicuna_seed_2_top_36_heads_alpha_5.0_fold_0_top_heads.npy",
+                      default="/work/hdd/bcxt/yian3/toxic/features/heads/False_vicuna_13B_toxigen_vicuna_seed_2_top_36_heads_fold_0.npy",
                       help='Path to selected heads numpy file')
     parser.add_argument('--alpha', type=float, default=15, help='alpha, intervention strength')
     parser.add_argument("--num_fold", type=int, default=2, help="number of folds")
@@ -129,8 +131,12 @@ def main():
         orig_model = 'llama3_70B_instruct'
     elif 'gemma3_4B' in args.model_name:
         orig_model = 'gemma3_4B'
+    elif 'mistral_7B_Instruct' in args.model_name:
+        orig_model = 'mistral_7B_Instruct'
     elif 'mistral_7B' in args.model_name:
         orig_model = 'mistral_7B'
+    elif 'qwen_7B' in args.model_name:
+        orig_model = 'qwen_7B'
     else:
         orig_model = args.model_name  # fallback
     
@@ -180,7 +186,14 @@ def main():
 
 
     # create model
-    model_name = HF_NAMES["honest_" + args.model_name if args.use_honest else args.model_name]
+    if args.model_name in ['llama3_8B']:
+        model_name = 'meta-llama/Meta-Llama-3-8B'
+    elif args.model_name in ['vicuna_13B']:
+        model_name = 'lmsys/vicuna-13b-v1.5'
+    elif args.model_name in HF_NAMES:
+        model_name = HF_NAMES[args.model_name]
+    else:
+        model_name = '/work/hdd/bcxt/yian3/toxic/models/' + args.model_name #HF_NAMES["honest_" + args.model_name if args.use_honest else args.model_name]
     MODEL = model_name if not args.model_dir else args.model_dir
     if "gpt2" in args.model_name:
         model = GPT2LMHeadModel.from_pretrained(
@@ -189,6 +202,10 @@ def main():
     elif "gemma3" in args.model_name:
         model = Gemma3ForConditionalGeneration.from_pretrained(MODEL, device_map="auto").eval()
         tokenizer = AutoProcessor.from_pretrained(MODEL)
+    elif "mistral" in args.model_name.lower() or "qwen" in args.model_name.lower():
+        # Use AutoModelForCausalLM for Mistral and Qwen models (they have their own model classes)
+        tokenizer = AutoTokenizer.from_pretrained(MODEL)
+        model = AutoModelForCausalLM.from_pretrained(MODEL, low_cpu_mem_usage=True, torch_dtype=torch.float16, device_map="auto")
     else:
         tokenizer = AutoTokenizer.from_pretrained(MODEL)
         # if args.model_name == 'llama_1B' or args.model_name == 'llama_3B' or args.model_name == 'llama3_8B':
@@ -232,26 +249,25 @@ def main():
     n,l,h,d = head_wise_activations.shape
     input_dim = l * h * d
     c_path = f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_c_all.pt"
-    print("=================================================================")
-
     if os.path.exists(c_path):
-        print(f"Loading cached c_all from {c_path}")
         head_wise_c = torch.load(c_path)
-        print("head_wise_c size", head_wise_c.size(), args.model_name)
+        print(f"Loaded head_wise_c from {c_path}")
     else:
-        print(f"No cached c_all found. Training VAE")
-        _, _, head_wise_c = train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=32, h_dim1=128, h_dim2=64,
-                                batch_size=128, lr=1e-3, vae_epochs=10, dataset_name=args.dataset_name, model_name=args.model_name, mode='valid', device='cuda')
-        print("head_wise_c size", head_wise_c.size(), args.model_name)
+        _, _, head_wise_c = train_vae_and_extract_mu(
+            head_wise_activations, labels, input_dim, z_dim=32, h_dim1=128, h_dim2=64,
+            batch_size=128, lr=1e-3, vae_epochs=10, dataset_name=args.dataset_name,
+            model_name=args.model_name, mode='valid', device='cuda'
+        )
+
+    _, _, head_wise_c = train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=32, h_dim1=128, h_dim2=64,
+                            batch_size=128, lr=1e-3, vae_epochs=10, dataset_name=args.dataset_name, model_name=args.model_name, mode='valid', device='cuda')
+    print("head_wise_c size", head_wise_c.size(), args.model_name)
     # separated_head_wise_activations, separated_labels, idxs_to_split_at = get_separated_activations(labels, head_wise_activations, categories[:100], args.dataset_name)
     separated_head_wise_activations, separated_labels, separated_head_wise_c, idxs_to_split_at = get_activations(labels, head_wise_activations, head_wise_c, args.dataset_name, args.model_name, args.alpha)
     
     # run k-fold cross validation
     results = []
     for i in range(args.num_fold):
-        if i == 1: 
-            break
-
         train_idxs = np.concatenate([fold_idxs[j] for j in range(args.num_fold) if j != i])
         test_idxs = fold_idxs[i]
 
@@ -285,21 +301,20 @@ def main():
             com_directions = get_matrix_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels)
         else:
             com_directions = None
-        # breakpoint()
         print("Finished computing com_directions of shape", com_directions.shape)
         if args.mode == 'get_top_heads':
             if args.use_pns:
                 top_heads, pns_scores = get_top_heads_pns(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels,
                             separated_head_wise_c, num_layers, num_heads, num_to_intervene=args.num_heads, lambda_reg=1e-4, sigma_sq=1.0, seed=42, use_random_dir=args.use_random_dir)
-                np.save(f'/work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_{i}_pns_scores.npy', pns_scores)
+                np.save(f'/work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_fold_{i}_pns_scores.npy', pns_scores)
                 probes = None
             else:
                 top_heads, probes = get_top_heads(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, num_layers, num_heads, args.seed, args.num_heads, args.use_random_dir)
-            np.save(f'/work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_{i}_top_heads.npy', top_heads)
-           
+            np.save(f'/work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_fold_{i}.npy', top_heads)
+            print(f"top heads saved to /work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_fold_{i}.npy")
             continue
 
-        args.heads_path = f'/work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_{i}_top_heads.npy'
+        args.heads_path = f'/work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_fold_{i}.npy'
         if os.path.exists(args.heads_path):
             selected_heads = np.load(args.heads_path)
             top_heads = selected_heads[:args.num_heads] if len(selected_heads) > args.num_heads else selected_heads
@@ -308,11 +323,11 @@ def main():
             if args.use_pns:
                 top_heads, pns_scores = get_top_heads_pns(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels,
                             separated_head_wise_c, num_layers, num_heads, num_to_intervene=args.num_heads, lambda_reg=1e-4, sigma_sq=1.0, seed=42, use_random_dir=args.use_random_dir)
-                np.save(f'/work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_{i}_pns_scores.npy', pns_scores)
+                np.save(f'/work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_fold_{i}_pns_scores.npy', pns_scores)
                 probes = None
             else:
                 top_heads, probes = get_top_heads(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, num_layers, num_heads, args.seed, args.num_heads, args.use_random_dir)
-        np.save(f'/work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_{i}_top_heads.npy', top_heads)
+        np.save(f'/work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_fold_{i}.npy', top_heads)
         print("Heads intervened: ", top_heads)
         interventions = get_interventions_dict(top_heads, probes, tuning_activations, num_heads, args.use_center_of_mass, args.use_random_dir, args.use_mat_direction, args.use_special_direction, com_directions)
         print("Finished computing interventions dict")
@@ -411,7 +426,8 @@ def main():
         print("output_path", output_path)
         curr_fold_results = alt_tqa_evaluate(
             {args.model_name: model}, 
-            ['judge', 'info'], #, 'mc'
+            # ['judge', 'info'], #, 'mc'
+            ['sense', 'bleu', 'rouge'], #, 'mc'
             input_path, 
             output_path, 
             summary_path, 

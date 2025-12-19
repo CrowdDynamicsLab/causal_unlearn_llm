@@ -311,6 +311,7 @@ def main():
 
 
     logger.info(f"No cached c_all found. Training VAE and saving to {c_path}")
+    # Limit samples to 8000 to avoid OOM (out of memory) issues
     _, _, head_wise_c = train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=32, h_dim1=128, h_dim2=64,
                             batch_size=128, lr=1e-3, vae_epochs=10, dataset_name=args.dataset_name, model_name=args.model_name, mode='valid', device='cuda')
     logger.info(f"head_wise_c size: {head_wise_c.size()}, model_name: {args.model_name}")
