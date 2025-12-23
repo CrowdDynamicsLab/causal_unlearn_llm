@@ -192,6 +192,7 @@ def tokenize_toxigen(dataset, dataset_non, tokenizer):
     all_prompts = []
     all_labels = []
     all_text = []
+    filtered_count = 0
     print("start tokenizing")
     for i in tqdm(range(len(dataset))):
         toxic_text = dataset['toxic paraphrase'][i]['text']
@@ -199,8 +200,14 @@ def tokenize_toxigen(dataset, dataset_non, tokenizer):
         text = dataset['original'][i]
         toxic_prompt = tokenizer(toxic_text, return_tensors='pt').input_ids
         non_toxic_prompt = tokenizer(non_toxic_text, return_tensors='pt').input_ids
-        if len(toxic_prompt[0]) == 1 or len(non_toxic_prompt[0]) == 1:
+        
+        # Filter out prompts that tokenize to only 1 token (likely only special tokens)
+        # Different tokenizers may tokenize the same text differently, causing different filtering
+        toxic_len = len(toxic_prompt[0])
+        non_toxic_len = len(non_toxic_prompt[0])
+        if toxic_len <= 1 or non_toxic_len <= 1:
             continue
+        
         toxic_label = 1
         non_toxic_label = 0
         all_prompts.append(toxic_prompt)
@@ -209,17 +216,24 @@ def tokenize_toxigen(dataset, dataset_non, tokenizer):
         all_labels.append(non_toxic_label)
         all_text.append((text, toxic_text, non_toxic_text))
     
+    print(f"Filtered {filtered_count} examples from dataset (out of {len(dataset)})")
+    
     if not dataset_non:
         return all_prompts, all_labels, all_text
-        
+    
+    filtered_count_non = 0
     for i in tqdm(range(len(dataset_non))):
         toxic_text = dataset_non['toxic paraphrase'][i]['text']
         non_toxic_text = dataset_non['non toxic paraphrase'][i]['text']
         text = dataset_non['original'][i]
         toxic_prompt = tokenizer(toxic_text, return_tensors='pt').input_ids
         non_toxic_prompt = tokenizer(non_toxic_text, return_tensors='pt').input_ids
-        if len(toxic_prompt[0]) == 1 or len(non_toxic_prompt[0]) == 1:
+        
+        toxic_len = len(toxic_prompt[0])
+        non_toxic_len = len(non_toxic_prompt[0])
+        if toxic_len <= 1 or non_toxic_len <= 1:
             continue
+        
         toxic_label = 1
         non_toxic_label = 0
         all_prompts.append(toxic_prompt)
@@ -227,6 +241,10 @@ def tokenize_toxigen(dataset, dataset_non, tokenizer):
         all_prompts.append(non_toxic_prompt)
         all_labels.append(non_toxic_label)
         all_text.append((text, toxic_text, non_toxic_text))
+    
+    print(f"Filtered {filtered_count_non} examples from dataset_non (out of {len(dataset_non)})")
+    print(f"Total filtered: {filtered_count + filtered_count_non}")
+    print(f"Final counts - prompts: {len(all_prompts)}, labels: {len(all_labels)}, texts: {len(all_text)}")
 
     return all_prompts, all_labels, all_text
 
@@ -306,7 +324,10 @@ def get_gpt2_activations_pyvene(collected_model, collectors, prompt, tokenizer, 
 
 def get_gemma_activations_pyvene(collected_model, collectors, prompt, device):
     with torch.no_grad():
-        prompt = prompt.to(device)
+        # Ensure prompt is Long tensor (required for embedding layer)
+        if not isinstance(prompt, torch.Tensor):
+            prompt = torch.tensor(prompt, dtype=torch.long)
+        prompt = prompt.to(device).long()
         output = collected_model({"input_ids": prompt, "output_hidden_states": True})[1]
     hidden_states = output.hidden_states
     hidden_states = torch.stack(hidden_states, dim = 0).squeeze()
@@ -328,7 +349,27 @@ def get_gemma_activations_pyvene(collected_model, collectors, prompt, device):
 
 def get_llama_activations_pyvene(collected_model, collectors, prompt, device):
     with torch.no_grad():
-        prompt = prompt.to(device)
+        # Ensure prompt is Long tensor (required for embedding layer)
+        if not isinstance(prompt, torch.Tensor):
+            prompt = torch.tensor(prompt, dtype=torch.long)
+        
+        # Ensure prompt has correct shape: should be [batch_size, seq_len]
+        # Tokenizer returns [1, seq_len], but handle both cases
+        if prompt.dim() == 1:
+            prompt = prompt.unsqueeze(0)  # [seq_len] -> [1, seq_len]
+        elif prompt.dim() == 0:
+            raise ValueError(f"Invalid prompt shape: {prompt.shape}. Expected 1D or 2D tensor.")
+        
+        # Verify prompt is not empty before moving to device
+        if prompt.shape[1] == 0:
+            raise ValueError(f"Empty prompt sequence detected! Prompt shape: {prompt.shape}, content: {prompt}")
+        
+        prompt = prompt.to(device).long()
+        
+        # Double-check shape after moving to device
+        if prompt.shape[1] == 0:
+            raise ValueError(f"Empty prompt after moving to device! Prompt shape: {prompt.shape}")
+        
         output = collected_model({"input_ids": prompt, "output_hidden_states": True})[1]
     hidden_states = output.hidden_states
     hidden_states = torch.stack(hidden_states, dim = 0).squeeze()
