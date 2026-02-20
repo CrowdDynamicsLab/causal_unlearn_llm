@@ -27,6 +27,7 @@ from pathlib import Path
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import pyvene as pv
+from sklearn.manifold import TSNE
 
 # Add path for utils
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -422,7 +423,7 @@ def plot_activation_changes(changes, top_heads, output_dir, alpha, num_heads, mo
             ax.set_xlabel('Dim 0')
             ax.set_ylabel('Dim 1')
         
-        ax.set_title(f'L{layer}H{head}\nL2: {changes[(layer, head)]["mean_l2_change"]:.3f}')
+        ax.set_title(f'L{layer}H{head}')
         ax.legend()
         ax.grid(True, alpha=0.3)
     
@@ -436,6 +437,97 @@ def plot_activation_changes(changes, top_heads, output_dir, alpha, num_heads, mo
     plt.close()
     
     print(f"Plots saved to {output_dir}")
+
+
+def plot_toxic_nontoxic_comparison(activations_before, activations_after, labels, top_heads, 
+                                   output_dir, alpha, num_heads, model_name, dataset_name):
+    """Plot toxic vs non-toxic representation comparison using t-SNE for top 8 heads."""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create filename prefix
+    filename_parts = []
+    if model_name:
+        model_name_clean = model_name.replace('/', '_').replace('-', '_')
+        filename_parts.append(model_name_clean)
+    if dataset_name:
+        dataset_name_clean = dataset_name.replace('/', '_').replace('-', '_')
+        filename_parts.append(dataset_name_clean)
+    
+    if filename_parts:
+        filename_prefix = "_".join(filename_parts) + "_"
+    else:
+        filename_prefix = ""
+    
+    labels = np.array(labels)
+    
+    # Plot for top 8 heads
+    n_plot = min(8, len(top_heads))
+    
+    for idx, (layer, head) in enumerate(top_heads[:n_plot]):
+        if (layer, head) not in activations_before or (layer, head) not in activations_after:
+            continue
+        
+        acts_before = np.array(activations_before[(layer, head)])
+        acts_after = np.array(activations_after[(layer, head)])
+        
+        if len(acts_before) == 0 or len(acts_before) != len(labels):
+            continue
+        
+        # Separate by toxic/non-toxic
+        toxic_before = acts_before[labels == 1]
+        nontoxic_before = acts_before[labels == 0]
+        toxic_after = acts_after[labels == 1]
+        nontoxic_after = acts_after[labels == 0]
+        
+        if len(toxic_before) == 0 or len(nontoxic_before) == 0:
+            continue
+        
+        # Combine all activations for t-SNE fitting
+        all_acts = np.vstack([toxic_before, nontoxic_before, toxic_after, nontoxic_after])
+        
+        # Apply t-SNE
+        print(f"Computing t-SNE for L{layer}H{head} ({idx+1}/{n_plot})...")
+        tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(all_acts) - 1))
+        all_acts_2d = tsne.fit_transform(all_acts)
+        
+        # Split back
+        n_toxic_before = len(toxic_before)
+        n_nontoxic_before = len(nontoxic_before)
+        n_toxic_after = len(toxic_after)
+        
+        toxic_before_2d = all_acts_2d[:n_toxic_before]
+        nontoxic_before_2d = all_acts_2d[n_toxic_before:n_toxic_before + n_nontoxic_before]
+        toxic_after_2d = all_acts_2d[n_toxic_before + n_nontoxic_before:n_toxic_before + n_nontoxic_before + n_toxic_after]
+        nontoxic_after_2d = all_acts_2d[n_toxic_before + n_nontoxic_before + n_toxic_after:]
+        
+        # Create plot
+        fig, ax = plt.subplots(figsize=(12, 10))
+        
+        # Plot with different colors and transparencies
+        # Before: light colors with transparency
+        # After: medium colors (lighter than dark) with higher transparency
+        ax.scatter(nontoxic_before_2d[:, 0], nontoxic_before_2d[:, 1], 
+                  alpha=0.4, label='Non-toxic (Before)', s=40, color='lightblue', marker='o')
+        ax.scatter(toxic_before_2d[:, 0], toxic_before_2d[:, 1], 
+                  alpha=0.4, label='Toxic (Before)', s=40, color='lightcoral', marker='o')
+        ax.scatter(nontoxic_after_2d[:, 0], nontoxic_after_2d[:, 1], 
+                  alpha=0.6, label='Non-toxic (After)', s=40, color='steelblue', marker='o')  # Lighter than darkblue
+        ax.scatter(toxic_after_2d[:, 0], toxic_after_2d[:, 1], 
+                  alpha=0.6, label='Toxic (After)', s=40, color='crimson', marker='o')  # Lighter than darkred
+        
+        ax.set_xlabel('Component 1', fontsize=14)
+        ax.set_ylabel('Component 2', fontsize=14)
+        ax.set_title(f'Representation Space Shift (Layer {layer}, Head {head}) - t-SNE', fontsize=16, fontweight='bold')
+        ax.legend(fontsize=12)
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(labelsize=12)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f'{filename_prefix}toxic_nontoxic_tsne_L{layer}H{head}_alpha{alpha}_top{num_heads}.pdf'), 
+                    format='pdf', bbox_inches='tight')
+        plt.close()
+    
+    print(f"Toxic vs non-toxic comparison plots saved to {output_dir} (generated {n_plot} plots)")
 
 
 def main():
@@ -491,26 +583,44 @@ def main():
         args.seed, args.fold
     )
     
-    # Get some test prompts
+    # Get some test prompts with labels
     print("Loading test prompts...")
     dataset_path = f'/work/hdd/bcxt/yian3/toxic/features/{args.dataset_name}_texts.json'
+    prompts = []
+    labels = []
     if os.path.exists(dataset_path):
         with open(dataset_path, 'r') as f:
             data = [json.loads(line) for line in f]
-        prompts = [item.get('text', item.get('prompt', '')) for item in data[:args.num_samples]]
+        for item in data[:args.num_samples]:
+            # Try to get toxic and non-toxic texts
+            if 'toxic_text' in item and 'non_toxic_text' in item:
+                # Add toxic text
+                prompts.append(item['toxic_text'])
+                labels.append(1)  # 1 for toxic
+                # Add non-toxic text
+                prompts.append(item['non_toxic_text'])
+                labels.append(0)  # 0 for non-toxic
+            elif 'text' in item:
+                prompts.append(item['text'])
+                # Try to get label
+                label = item.get('label', 0)
+                if isinstance(label, str):
+                    label = 1 if label.lower() in ['toxic', 'hate', '1'] else 0
+                labels.append(int(label))
     else:
-        # Fallback prompts
+        # Fallback prompts (no labels)
         prompts = [
             "What is the capital of France?",
             "Explain how photosynthesis works.",
             "What are the benefits of exercise?",
         ] * (args.num_samples // 3 + 1)
         prompts = prompts[:args.num_samples]
+        labels = [0] * len(prompts)
     
     # Collect activations
     print("Collecting activations...")
     activations_before, activations_after = collect_activations_with_intervention(
-        model, tokenizer, prompts, top_heads, interventions, args.alpha, device, args.num_samples
+        model, tokenizer, prompts, top_heads, interventions, args.alpha, device, len(prompts)
     )
     
     # Compute changes
@@ -521,6 +631,12 @@ def main():
     print("Generating plots...")
     plot_activation_changes(changes, top_heads, args.output_dir, args.alpha, args.num_heads, args.model_name, args.dataset_name)
     
+    # Plot toxic vs non-toxic comparison
+    if len(labels) > 0 and len(set(labels)) > 1:  # Only if we have labels
+        print("Generating toxic vs non-toxic comparison plots...")
+        plot_toxic_nontoxic_comparison(activations_before, activations_after, labels, top_heads, 
+                                       args.output_dir, args.alpha, args.num_heads, args.model_name, args.dataset_name)
+    
     print("Done!")
 
 
@@ -528,13 +644,13 @@ if __name__ == "__main__":
     main()
 
 """
-python plot_activations.py --num_heads 36 --alpha 10.0 \
-    --model_name vicuna_7B --dataset_name paradetox \
-    --heads_path /work/hdd/bcxt/yian3/toxic/features/heads/True_vicuna_7B_paradetox_seed_2_top_72_heads_fold_0.npy \
-    --output_dir ./activation_plots --num_samples 50
+python plot_activations.py --num_heads 36 --alpha 5.0 \
+    --model_name llama3_8B --dataset_name toxigen_vicuna \
+    --heads_path /work/hdd/bcxt/yian3/toxic/features/heads/True_llama3_8B_toxigen_vicuna_seed_2_top_72_heads_fold_0.npy \
+    --output_dir ./activation_plots --num_samples 100
 
 python plot_activations.py --num_heads 36 --alpha 5.0 \
     --model_name llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_True_0.001_epoch5 --dataset_name toxigen_vicuna \
-    --heads_path /work/hdd/bcxt/yian3/toxic/features/heads/False_llama3_8B_toxigen_vicuna_seed_2_top_72_heads_fold_0.npy \
-    --output_dir ./activation_plots --num_samples 50
+    --heads_path /work/hdd/bcxt/yian3/toxic/features/heads/True_llama3_8B_toxigen_vicuna_seed_2_top_72_heads_fold_0.npy \
+    --output_dir ./activation_plots --num_samples 100
 """

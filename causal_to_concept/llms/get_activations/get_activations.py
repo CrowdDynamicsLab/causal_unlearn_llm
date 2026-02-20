@@ -12,7 +12,7 @@ sys.path.append('../')
 # import llama
 import pickle
 import argparse
-from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM # , Gemma3ForCausalLM, Gemma3ForConditionalGeneration
+from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
 import torch
 
 # Specific pyvene imports
@@ -20,12 +20,20 @@ from utils import get_llama_activations_pyvene, tokenized_tqa, tokenized_tqa_gen
 from interveners import wrapper, Collector, ITI_Intervener
 import pyvene as pv
 
+# Try to import Gemma3 classes, but handle if not available
+try:
+    from transformers import Gemma3ForConditionalGeneration, AutoProcessor
+except ImportError:
+    Gemma3ForConditionalGeneration = None
+    AutoProcessor = None
+
 HF_NAMES = {
     'llama_1B': 'meta-llama/Llama-3.2-1B',
     'llama_3B': 'meta-llama/Llama-3.2-3B',
     'llama_7B': 'huggyllama/llama-7b',
     'alpaca_7B': 'circulus/alpaca-7b', 
     'vicuna_7B': 'AlekseyKorshuk/vicuna-7b', 
+    'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
     'llama2_chat_7B': 'meta-llama/Llama-2-7b-chat-hf', 
     'llama2_chat_13B': 'meta-llama/Llama-2-13b-chat-hf', 
     'llama2_chat_70B': 'meta-llama/Llama-2-70b-chat-hf', 
@@ -85,14 +93,21 @@ def main():
     parser.add_argument('--device', type=int, default=0)
     args = parser.parse_args()
     print(args.model_name)
-    model_name_or_path = HF_NAMES[args.model_prefix + args.model_name]
+    if args.model_name in HF_NAMES:
+        model_name_or_path = HF_NAMES[args.model_name]
+    else:
+        model_name_or_path = '/work/hdd/bcxt/yian3/toxic/models/' + args.model_name
 
     if args.model_name == "gemma3_4B":
+        if Gemma3ForConditionalGeneration is None:
+            raise ImportError(
+                "Gemma3ForConditionalGeneration is not available. "
+                "You may need to update transformers: pip install --upgrade transformers"
+            )
         model = Gemma3ForConditionalGeneration.from_pretrained(
-            args.model_name, device_map="auto"
+            model_name_or_path, device_map="auto"
         ).eval()
-
-        processor = AutoProcessor.from_pretrained(args.model_name)
+        tokenizer = AutoProcessor.from_pretrained(model_name_or_path)
     else:
         tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
         model = AutoModelForCausalLM.from_pretrained(model_name_or_path, low_cpu_mem_usage=True, torch_dtype=torch.float16, device_map="auto")
@@ -101,23 +116,8 @@ def main():
     if hasattr(tokenizer, 'pad_token') and tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     device = "cuda"
-    if args.dataset_name == "toxigen":
-        dataset = load_dataset("json", data_files="../../../dataset/toxiGen.json")["train"]
-        # # Split off 20% for validation
-        # split = dataset.train_test_split(test_size=0.2)
-        # train_dataset = split["train"]
-        # val_dataset = split["test"]
-        formatter = tokenize_toxicity_dataset
-
-    elif args.dataset_name == "hate":
-        # # Split off 20% for validation
-        # split = dataset.train_test_split(test_size=0.2)
-        # train_dataset = split["train"]
-        # val_dataset = split["test"]
-        dataset = load_dataset("json", data_files="../../../dataset/implicitHate.json")["train"]
-        formatter = tokenize_toxicity_dataset 
         
-    elif args.dataset_name == "toxigen_vicuna":
+    if args.dataset_name == "toxigen_vicuna":
         # dataset = load_dataset("json", data_files="../../../dataset/toxiGen.json")["train"]
         # # Split off 20% for validation
         # split = dataset.train_test_split(test_size=0.2)
@@ -138,7 +138,7 @@ def main():
         formatter = tokenize_toxigen 
 
     elif args.dataset_name == "paradetox":
-        paradetox_path = f'/work/hdd/bcxt/yian3/toxic/features/paradetox_texts.json'
+        paradetox_path = f'/work/hdd/bcxt/yian3/toxic/features/paradetox.json'
         with open(paradetox_path, 'r') as f:
             dataset = json.load(f)
         formatter = tokenize_paradetox
@@ -172,7 +172,7 @@ def main():
         #     prompts = prompts[: half * 2]
         #     labels = labels[: half * 2]
         #     texts = texts[: half]
-        output_path = f'/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_texts.json'
+        output_path = f'/work/hdd/bcxt/yian3/toxic/features/{args.dataset_name}_texts.json'
         if not os.path.exists(output_path):
             with open(output_path, 'w') as f:
                 for sentence in texts:
@@ -187,7 +187,18 @@ def main():
         print(len(labels), len(prompts), len(texts))
     elif args.dataset_name == "paradetox": 
         prompts, labels, texts = formatter(dataset, tokenizer)
-        
+        output_path = f'/work/hdd/bcxt/yian3/toxic/features/{args.dataset_name}_texts.json'
+        if not os.path.exists(output_path):
+            with open(output_path, 'w') as f:
+                for sentence in texts:
+                    text = sentence[0]
+                    toxic_text = sentence[1]
+                    non_toxic_text = sentence[2]
+                    json.dump({"text": text,
+                            "toxic_text": toxic_text,
+                            "non_toxic_text": non_toxic_text,
+                            }, f)
+                    f.write("\n")
         print(len(labels), len(prompts), len(texts))
     else: 
         prompts, labels = formatter(dataset, tokenizer)

@@ -239,7 +239,7 @@ def train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=1, 
     c_all = torch.cat([train_mu, val_mu], dim=0)
 
     acc, f1 = evaluate_latent_mu(train_mu.cpu(), y_train.cpu(), val_mu.cpu(), y_val.cpu())
-    torch.save(c_all, f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_c_all.pt")
+    # torch.save(c_all, f"/work/hdd/bcxt/yian3/toxic/features/{args.model_name}_{args.dataset_name}_c_all.pt")
 
     return train_mu, val_mu, c_all, sigma_sq_estimate
 
@@ -674,9 +674,11 @@ def train_model(model, train_loader, eval_loader, optimizer, selected_heads, par
                 total_loss = logpns 
                 
                 # Add L2 regularization if enabled
+                # Note: Since optimizer uses maximize=True, we subtract L2 loss to minimize it
+                # while maximizing logpns
                 if args.use_l2:
                     l2_loss = calculate_l2_loss(model, selected_heads, args.l2_lambda)
-                    total_loss = total_loss + l2_loss
+                    total_loss = total_loss - l2_loss  # Subtract because we're maximizing (want to minimize L2)
                     print("L2 loss:", l2_loss.item())
                 
                 print("Term1:", term1)

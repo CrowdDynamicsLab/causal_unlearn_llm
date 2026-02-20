@@ -18,12 +18,12 @@ import json
 def load_data_like_validate_2fold(dataset_name):
     """Load data the same way as validate_2fold_toxic.py"""
     if dataset_name == "toxigen_vicuna":
-        toxigen_path = f'/work/hdd/bcxt/yian3/toxic/features/llama3_8B_{dataset_name}_texts.json'
+        toxigen_path = f'/work/hdd/bcxt/yian3/toxic/features/{dataset_name}_texts.json'
         with open(toxigen_path) as f:
             data = [json.loads(line) for line in f]
         df = pd.DataFrame(data)
     elif dataset_name == "hate_vicuna":
-        hate_path = f'/work/hdd/bcxt/yian3/toxic/features/llama3_8B_{dataset_name}_texts.json'
+        hate_path = f'/work/hdd/bcxt/yian3/toxic/features/{dataset_name}_texts.json'
         with open(hate_path) as f:
             data = [json.loads(line) for line in f]
         df = pd.DataFrame(data)
@@ -115,7 +115,6 @@ def build_local_store_for_data(toxic_texts, nontoxic_texts, model, tokenizer, ou
     print("Generating sentence embeddings...")
     sentence_embedding = SentenceTransformer('all-MiniLM-L6-v2')
     keys = sentence_embedding.encode(toxic_texts)
-    print(f"Use build_topk_neighbors.py to saved keys to {keys_path}, shape: {keys.shape}")
     
     # Load selected heads if provided
     if selected_heads is not None:
@@ -182,7 +181,6 @@ def build_local_store_for_data(toxic_texts, nontoxic_texts, model, tokenizer, ou
         'num_examples': len(toxic_texts),
         'num_heads': len(head_combinations),
         'head_combinations': head_combinations,  # Already a list of Python tuples
-        'keys_shape': keys.shape.tolist(),  # Convert numpy array shape to list
         'description': 'Per-input difference vectors for contextual interventions'
     }
     metadata_path = os.path.join(output_dir, "metadata.json")
@@ -191,12 +189,10 @@ def build_local_store_for_data(toxic_texts, nontoxic_texts, model, tokenizer, ou
     
     print(f"\n{data_name} store built successfully in {output_dir}")
     print("Files created:")
-    print(f"  - keys.npy: {keys.shape} (sentence embeddings for indexing)")
     print(f"  - diffs/L{{l}}_H{{h}}.npy: {len(head_combinations)} files (per-input difference vectors)")
     print(f"  - diffs/L{{l}}_H{{h}}_metadata.json: {len(head_combinations)} files (per-head metadata)")
     print(f"  - metadata.json: Overall store metadata")
     print("\nUsage:")
-    print("  - Load keys.npy to get sentence embeddings")
     print("  - Load diffs/L{l}_H{h}.npy to get difference vectors for specific head")
     print("  - Index by example number to get specific difference vector")
     print("  - Use for contextual interventions during inference")
@@ -285,8 +281,8 @@ python build_local_store.py \
 # For testing (limit examples)
 python build_local_store.py \
   --dataset_name toxigen_vicuna \
-  --model_name llama3_8B \
-  --heads_path /work/hdd/bcxt/yian3/toxic/features/heads/True_llama3_8B_toxigen_vicuna_seed_2_top_72_heads_fold_0.npy \
+  --model_name llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_True_0.001_epoch5 \
+  --heads_path /work/hdd/bcxt/yian3/toxic/features/heads/True_llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_True_0.001_epoch5_toxigen_vicuna_seed_2_top_72_heads_fold_0.npy \
   --output_dir /work/hdd/bcxt/yian3/toxic/local_store_toxigen 
 python consolidate_diffs.py        
 """

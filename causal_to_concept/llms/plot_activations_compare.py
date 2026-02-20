@@ -14,7 +14,7 @@ Usage example:
         --model_name_1 llama3_8B --model_name_2 llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_True_0.001_epoch5 \
         --dataset_name toxigen_vicuna \
         --heads_path /work/hdd/bcxt/yian3/toxic/features/heads/True_llama3_8B_toxigen_vicuna_seed_2_top_72_heads_fold_0.npy \
-        --output_dir ./activation_plots_ft --num_samples 50
+        --output_dir ./activation_plots_ft --num_samples 100
 """
 
 import argparse
@@ -29,6 +29,7 @@ from pathlib import Path
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import pyvene as pv
+from sklearn.manifold import TSNE
 
 # Add path for utils
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -164,6 +165,113 @@ def compare_models(changes_1, changes_2, top_heads, output_dir, alpha, num_heads
     print(f"Comparison plots saved to {output_dir}")
 
 
+def plot_toxic_nontoxic_comparison_models(activations_before_1, activations_before_2, labels, 
+                                          top_heads, output_dir, alpha, num_heads, 
+                                          model_name_1, model_name_2, dataset_name):
+    """Plot toxic vs non-toxic representation comparison for two models using t-SNE."""
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Create filename prefix
+    filename_parts = []
+    if model_name_1:
+        model_name_1_clean = model_name_1.replace('/', '_').replace('-', '_')
+        filename_parts.append(model_name_1_clean)
+    if model_name_2:
+        model_name_2_clean = model_name_2.replace('/', '_').replace('-', '_')
+        filename_parts.append(model_name_2_clean)
+    if dataset_name:
+        dataset_name_clean = dataset_name.replace('/', '_').replace('-', '_')
+        filename_parts.append(dataset_name_clean)
+    
+    if filename_parts:
+        filename_prefix = "_".join(filename_parts) + "_"
+    else:
+        filename_prefix = ""
+    
+    labels = np.array(labels)
+    
+    # Convert top_heads to tuples if needed
+    top_heads_tuples = []
+    for h in top_heads:
+        if isinstance(h, np.ndarray):
+            top_heads_tuples.append(tuple(h.tolist()))
+        elif isinstance(h, list):
+            top_heads_tuples.append(tuple(h))
+        else:
+            top_heads_tuples.append(h)
+    
+    # Plot for top 8 heads
+    n_plot = min(8, len(top_heads_tuples))
+    
+    for idx, (layer, head) in enumerate(top_heads_tuples[:n_plot]):
+        if (layer, head) not in activations_before_1 or (layer, head) not in activations_before_2:
+            continue
+        
+        acts_before_1 = np.array(activations_before_1[(layer, head)])
+        acts_before_2 = np.array(activations_before_2[(layer, head)])
+        
+        if len(acts_before_1) == 0 or len(acts_before_1) != len(labels) or len(acts_before_2) != len(labels):
+            continue
+        
+        # Separate by toxic/non-toxic for model 1
+        toxic_before_1 = acts_before_1[labels == 1]
+        nontoxic_before_1 = acts_before_1[labels == 0]
+        
+        # Separate by toxic/non-toxic for model 2
+        toxic_before_2 = acts_before_2[labels == 1]
+        nontoxic_before_2 = acts_before_2[labels == 0]
+        
+        if len(toxic_before_1) == 0 or len(nontoxic_before_1) == 0:
+            continue
+        
+        # Combine all activations for t-SNE fitting
+        all_acts = np.vstack([toxic_before_1, nontoxic_before_1, toxic_before_2, nontoxic_before_2])
+        
+        # Apply t-SNE
+        print(f"Computing t-SNE for L{layer}H{head} ({idx+1}/{n_plot})...")
+        tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, len(all_acts) - 1))
+        all_acts_2d = tsne.fit_transform(all_acts)
+        
+        # Split back
+        n_toxic_1 = len(toxic_before_1)
+        n_nontoxic_1 = len(nontoxic_before_1)
+        n_toxic_2 = len(toxic_before_2)
+        
+        toxic_before_1_2d = all_acts_2d[:n_toxic_1]
+        nontoxic_before_1_2d = all_acts_2d[n_toxic_1:n_toxic_1 + n_nontoxic_1]
+        toxic_before_2_2d = all_acts_2d[n_toxic_1 + n_nontoxic_1:n_toxic_1 + n_nontoxic_1 + n_toxic_2]
+        nontoxic_before_2_2d = all_acts_2d[n_toxic_1 + n_nontoxic_1 + n_toxic_2:]
+        
+        # Create plot
+        fig, ax = plt.subplots(figsize=(12, 10))
+        
+        # Plot model 1 (base model)
+        ax.scatter(nontoxic_before_1_2d[:, 0], nontoxic_before_1_2d[:, 1], 
+                  alpha=0.4, label=f'{model_name_1} - Non-toxic', s=40, color='lightblue', marker='o')
+        ax.scatter(toxic_before_1_2d[:, 0], toxic_before_1_2d[:, 1], 
+                  alpha=0.4, label=f'{model_name_1} - Toxic', s=40, color='lightcoral', marker='o')
+        
+        # Plot model 2 (finetuned model)
+        ax.scatter(nontoxic_before_2_2d[:, 0], nontoxic_before_2_2d[:, 1], 
+                  alpha=0.6, label=f'{model_name_2} - Non-toxic', s=40, color='steelblue', marker='s')
+        ax.scatter(toxic_before_2_2d[:, 0], toxic_before_2_2d[:, 1], 
+                  alpha=0.6, label=f'{model_name_2} - Toxic', s=40, color='crimson', marker='s')
+        
+        ax.set_xlabel('Component 1', fontsize=14)
+        ax.set_ylabel('Component 2', fontsize=14)
+        ax.set_title(f'Representation Comparison (Layer {layer}, Head {head}) - t-SNE', fontsize=16, fontweight='bold')
+        ax.legend(fontsize=12)
+        ax.grid(True, alpha=0.3)
+        ax.tick_params(labelsize=12)
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, f'{filename_prefix}toxic_nontoxic_compare_L{layer}H{head}_alpha{alpha}_top{num_heads}.pdf'), 
+                    format='pdf', bbox_inches='tight')
+        plt.close()
+    
+    print(f"Toxic vs non-toxic comparison plots saved to {output_dir} (generated {n_plot} plots)")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Compare activations between two models")
     parser.add_argument("--num_heads", type=int, default=18, help="Number of top heads")
@@ -246,31 +354,50 @@ def main():
         args.seed, args.fold
     )
     
-    # Get test prompts
+    # Get test prompts with labels
     print("\nLoading test prompts...")
     dataset_path = f'/work/hdd/bcxt/yian3/toxic/features/{args.dataset_name}_texts.json'
+    prompts = []
+    labels = []
     if os.path.exists(dataset_path):
         with open(dataset_path, 'r') as f:
             data = [json.loads(line) for line in f]
-        prompts = [item.get('text', item.get('prompt', '')) for item in data[:args.num_samples]]
+        for item in data[:args.num_samples]:
+            # Try to get toxic and non-toxic texts
+            if 'toxic_text' in item and 'non_toxic_text' in item:
+                # Add toxic text
+                prompts.append(item['toxic_text'])
+                labels.append(1)  # 1 for toxic
+                # Add non-toxic text
+                prompts.append(item['non_toxic_text'])
+                labels.append(0)  # 0 for non-toxic
+            elif 'text' in item:
+                prompts.append(item['text'])
+                # Try to get label
+                label = item.get('label', 0)
+                if isinstance(label, str):
+                    label = 1 if label.lower() in ['toxic', 'hate', '1'] else 0
+                labels.append(int(label))
     else:
+        # Fallback prompts (no labels)
         prompts = [
             "What is the capital of France?",
             "Explain how photosynthesis works.",
             "What are the benefits of exercise?",
         ] * (args.num_samples // 3 + 1)
         prompts = prompts[:args.num_samples]
+        labels = [0] * len(prompts)
     
     # Collect activations for model 1
     print(f"\nCollecting activations for {args.model_name_1}...")
     activations_before_1, activations_after_1 = collect_activations_with_intervention(
-        model_1, tokenizer_1, prompts, top_heads, interventions_1, args.alpha, device_1, args.num_samples
+        model_1, tokenizer_1, prompts, top_heads, interventions_1, args.alpha, device_1, len(prompts)
     )
     
     # Collect activations for model 2
     print(f"\nCollecting activations for {args.model_name_2}...")
     activations_before_2, activations_after_2 = collect_activations_with_intervention(
-        model_2, tokenizer_2, prompts, top_heads, interventions_2, args.alpha, device_2, args.num_samples
+        model_2, tokenizer_2, prompts, top_heads, interventions_2, args.alpha, device_2, len(prompts)
     )
     
     # Compute changes
@@ -282,6 +409,13 @@ def main():
     print("\nGenerating comparison plots...")
     compare_models(changes_1, changes_2, top_heads, args.output_dir, args.alpha, args.num_heads,
                    args.model_name_1, args.model_name_2, args.dataset_name)
+    
+    # Plot toxic vs non-toxic comparison for both models
+    if len(labels) > 0 and len(set(labels)) > 1:  # Only if we have labels
+        print("\nGenerating toxic vs non-toxic comparison plots for both models...")
+        plot_toxic_nontoxic_comparison_models(activations_before_1, activations_before_2, labels, 
+                                              top_heads, args.output_dir, args.alpha, args.num_heads,
+                                              args.model_name_1, args.model_name_2, args.dataset_name)
     
     print("Done!")
 

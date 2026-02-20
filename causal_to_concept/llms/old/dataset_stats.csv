@@ -1,0 +1,4 @@
+dataset,field,avg_word_length,avg_char_length,avg_toxic_score,count,toxic_score_count
+toxigen_vicuna,text,17.951416387450504,95.82378921717941,0.2036596,6566,6566
+toxigen_vicuna,non_toxic_text,26.687176363082546,169.85440146207736,0.012426572,6566,6566
+toxigen_vicuna,toxic_text,24.160828510508683,176.98857752056045,0.39970776,6566,6566

@@ -24,118 +24,100 @@ from sklearn.linear_model import LogisticRegression
 from sentence_transformers import SentenceTransformer
 from vae import VAE, vae_loss_function, train_vae, test_vae
 import pickle
-from functools import partial
 from pprint import pprint
-# Initialize sentence embedding model for contextual interventions
-sentence_embedding = SentenceTransformer('all-MiniLM-L6-v2')
-class RetrievalLocalSteerer:
-    """
-    Retrieval-conditioned steering: given a prompt key and (layer, head),
-    return a similarity-weighted local steering vector with optional shrinkage
-    to a provided global vector.
-    """
-    def __init__(self, store_dir, num_layers, num_heads, device='cuda'):
-        self.device = device
-        self.keys = torch.from_numpy(np.load(os.path.join(store_dir, "keys.npy"))).float()
-        self.keys = self.keys / (self.keys.norm(dim=1, keepdim=True) + 1e-8)  # unit norm
-        self.keys = self.keys.to(device)
-        self.diffs = {}  # (l,h) -> [M, d_head] tensor on device
-        for l in range(num_layers):
-            for h in range(num_heads):
-                path = os.path.join(store_dir, "diffs", f"L{l}_H{h}.npy")
-                if os.path.exists(path):
-                    arr = np.load(path, mmap_mode='r')  # memory friendly
-                    self.diffs[(l, h)] = torch.from_numpy(np.asarray(arr)).to(device=device, dtype=torch.float32)
-        print(f"[LocalSteerer] Loaded keys {tuple(self.keys.shape)}, diffs for {len(self.diffs)} heads.")
-
-    @torch.no_grad()
-    def local_vector(self, l, h, key_vec, N=64, tau=20.0, v_global=None, lam_from_sim=True):
-        """
-        key_vec: torch.FloatTensor [d_k], already on device (normalized recommended)
-        returns: v_mix [d_head] (torch.FloatTensor on device)
-        """
-        # fall back if missing
-        if (l, h) not in self.diffs:
-            return None
-
-        key = key_vec / (key_vec.norm() + 1e-8)
-        sims = self.keys @ key  # [M]
-        N = min(N, sims.shape[0])
-        topv, topi = torch.topk(sims, k=N, dim=0)
-        w = torch.softmax(tau * topv, dim=0)                  # [N]
-        D = self.diffs[(l, h)][topi]                          # [N, d_head]
-        v_local = (w[:, None] * D).sum(dim=0)                 # [d_head]
-
-        if v_global is None or not lam_from_sim:
-            return v_local
-        lam = float(torch.clamp(0.5 / (topv.mean() + 1e-6), 0.0, 1.0))  # shrink if weak
-        v_mix = (1.0 - lam) * v_local + lam * torch.as_tensor(v_global, device=self.device, dtype=v_local.dtype)
-        return v_mix
-
-
-def create_local_builder(global_interventions, local_steerer, retrieval_N=64, retrieval_tau=20.0):
-    """
-    Create a local_builder function that returns per-example interventions
-    compatible with the existing intervention structure.
-    """
-    def local_builder(prompt_text, k=64):
-        """
-        Build local interventions for a given prompt text.
-        Returns interventions dict in same format as global_interventions.
-        """
-        if local_steerer is None:
-            return None
-            
-        # Encode the prompt (assuming sentence_embedding is available globally)
-        try:
-            key_vec = sentence_embedding.encode(prompt_text)
-            key_vec = torch.tensor(key_vec, dtype=torch.float32, device=local_steerer.device)
-        except:
-            return None
-            
-        local_interventions = {}
-        
-        for layer_name, head_list in global_interventions.items():
-            # Parse layer index from layer_name (e.g., "model.layers.8.self_attn")
-            if "gpt2" in layer_name:
-                layer = int(layer_name.split('.')[1])
-            else:
-                layer = int(layer_name.split('.')[2])
-                
-            local_head_list = []
-            
-            for head, direction, proj_val_std in head_list:
-                # Get local vector for this (layer, head)
-                v_global = direction if len(direction.shape) == 1 else None
-                v_mix = local_steerer.local_vector(
-                    layer, head, key_vec, 
-                    N=min(k, retrieval_N), 
-                    tau=retrieval_tau,
-                    v_global=v_global, 
-                    lam_from_sim=True
-                )
-                
-                if v_mix is not None:
-                    # Use local vector
-                    local_head_list.append((head, v_mix.cpu().numpy(), proj_val_std))
-                else:
-                    # Fall back to global
-                    local_head_list.append((head, direction, proj_val_std))
-                    
-            local_interventions[layer_name] = local_head_list
-            
-        return local_interventions
-    
-    return local_builder
-
-
 
 from TruthfulQA.truthfulqa import utilities, models, metrics
 import openai
+from time import sleep
+import time
 from TruthfulQA.truthfulqa.configs import BEST_COL, ANSWER_COL, INCORRECT_COL
 
+from TruthfulQA.truthfulqa.utilities import (
+    format_prompt,
+    format_prompt_with_answer_strings,
+    split_multi_answer,
+    format_best,
+    find_start,
+)
+from TruthfulQA.truthfulqa.presets import preset_map, COMPARE_PRIMER
+from TruthfulQA.truthfulqa.models import find_subsequence, set_columns, MC_calcs
+from TruthfulQA.truthfulqa.evaluates import format_frame, data_to_dict
+
+
+# Initialize sentence embedding model for contextual interventions
 sentence_embedding = SentenceTransformer('all-MiniLM-L6-v2')
 
+# local_store.py
+import os, numpy as np, torch
+
+
+def _maybe_cuda_sync(device=None):
+    """
+    Best-effort CUDA sync helper for accurate wall-clock timing.
+    Safe to call in CPU-only environments.
+    """
+    try:
+        if torch.cuda.is_available():
+            # If device is specified, only sync for cuda-like devices.
+            if device is None:
+                torch.cuda.synchronize()
+            else:
+                dev_str = str(device)
+                if "cuda" in dev_str:
+                    torch.cuda.synchronize()
+    except Exception:
+        # Never let timing utilities crash the main pipeline
+        return
+
+
+class TimingStats:
+    """
+    Aggregates timing measurements (seconds) across many prompts.
+    - retrieval_knn_sec: time spent doing kNN lookup only (neighbors + sims fetch or brute-force search)
+    - baseline_gen_sec: generation time with NO interventions
+    - steered_gen_sec: generation time with interventions enabled
+    """
+    def __init__(self):
+        self.retrieval_knn_sec = 0.0
+        self.retrieval_knn_calls = 0
+        self.baseline_gen_sec = 0.0
+        self.baseline_gen_prompts = 0
+        self.steered_gen_sec = 0.0
+        self.steered_gen_prompts = 0
+
+    def add_knn(self, dt_sec: float):
+        self.retrieval_knn_sec += float(dt_sec)
+        self.retrieval_knn_calls += 1
+
+    def add_baseline_gen(self, dt_sec: float):
+        self.baseline_gen_sec += float(dt_sec)
+        self.baseline_gen_prompts += 1
+
+    def add_steered_gen(self, dt_sec: float):
+        self.steered_gen_sec += float(dt_sec)
+        self.steered_gen_prompts += 1
+
+    def avg_knn_sec(self) -> float:
+        return self.retrieval_knn_sec / max(self.retrieval_knn_calls, 1)
+
+    def avg_baseline_gen_sec(self) -> float:
+        return self.baseline_gen_sec / max(self.baseline_gen_prompts, 1)
+
+    def avg_steered_gen_sec(self) -> float:
+        return self.steered_gen_sec / max(self.steered_gen_prompts, 1)
+
+    def summary_str(self) -> str:
+        base_avg = self.baseline_gen_sec / max(self.baseline_gen_prompts, 1)
+        steer_avg = self.steered_gen_sec / max(self.steered_gen_prompts, 1)
+        knn_avg = self.retrieval_knn_sec / max(self.retrieval_knn_calls, 1)
+        overhead_avg = steer_avg - base_avg if self.baseline_gen_prompts > 0 else float("nan")
+        return (
+            "=== Timing breakdown (averages) ===\n"
+            f"- kNN retrieval (only): {knn_avg:.6f}s  (calls={self.retrieval_knn_calls})\n"
+            f"- Baseline generation (no intervention): {base_avg:.6f}s  (prompts={self.baseline_gen_prompts})\n"
+            f"- Total generation (with intervention): {steer_avg:.6f}s  (prompts={self.steered_gen_prompts})\n"
+            f"- Intervention overhead (delta): {overhead_avg:.6f}s\n"
+        )
 ENGINE_MAP = {
     'llama_1B': 'meta-llama/Llama-3.2-1B', 
     'llama_3B': 'meta-llama/Llama-3.2-3B',
@@ -148,8 +130,9 @@ ENGINE_MAP = {
     'llama3_8B': 'meta-llama/Meta-Llama-3-8B',
     'vicuna_13B': 'lmsys/vicuna-13b-v1.5',
     'gemma3_4B': 'google/gemma-3-4b-it',
-    'mistral_7B_Instruct': 'mistralai/Mistral-7B-Instruct-v0.2',
-    'qwen_7B': 'Qwen/Qwen2.5-7B-Instruct',
+    'vicuna_pns': '/work/hdd/bcxt/yian3/models/vicuna_pns_finetuned',
+    'COV_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_finetuned_epoch5',
+    'COV_pns_use_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_True_finetuned_epoch5',
     'vicuna_13B_toxigen_vicuna_18_0.0001_acc': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_accuracy_18_False_0.0001_finetuned_epoch5',
     'vicuna_13B_toxigen_vicuna_18_0.01_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_True_0.01_finetuned_epoch5',
     'vicuna_13B_toxigen_vicuna_18_0.0001_pns': '/work/hdd/bcxt/yian3/toxic/models/vicuna_13B_toxigen_vicuna_logpns_18_True_0.0001_finetuned_epoch5',
@@ -180,20 +163,314 @@ ENGINE_MAP = {
     'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_epoch5',
     'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_True_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_True_epoch5',
     'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_True_0.001_epoch5': '/work/hdd/bcxt/yian3/toxic/models/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_l20.0001_useKL_True_0.001_epoch5',
-    'llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_useKL_True_0.05_epoch5': '/work/hdd/bcxt/yian3/toxic/models/tox_par/llama3_8B_toxigen_vicuna_logpns_36_True_1e-05_0.001_finetuned_useKL_True_0.05_epoch5',
 }
 
-from TruthfulQA.truthfulqa.utilities import (
-    format_prompt,
-    format_prompt_with_answer_strings,
-    split_multi_answer,
-    format_best,
-    find_start,
-)
-from TruthfulQA.truthfulqa.presets import preset_map, COMPARE_PRIMER
-from TruthfulQA.truthfulqa.models import find_subsequence, set_columns, MC_calcs
-from TruthfulQA.truthfulqa.evaluates import format_frame, data_to_dict
 
+class LocalStore:
+    def __init__(self, pattern_name, store_dir, heads_to_edit, device="cuda", K_default=64):
+        """
+        pattern_name: string, the name of the model
+        store_dir: string, the directory of the store
+        heads_to_edit: list of tuples, each tuple is a (layer, head)
+        device: string, the device to use
+        K_default: int, the default number of neighbors to use
+        store_dir expects:
+          keys.npy                 [N, d_k] (unit-norm)
+          (optional) keys_toxic.npy [N, d_k] (unit-norm)  # for contrastive weights
+          neighbors_top*.npy       [N, K_saved] int32      # optional (for training rows)
+          sims_top*.npy            [N, K_saved] float16    # optional (for training rows)
+          diffs_consolidated.pkl   dict with (L,H) -> [N, d_head] arrays
+        """
+        self.store_dir = store_dir
+        self.device = device
+        self.keys = np.load(os.path.join(store_dir, "keys.npy")).astype("float32")  # [N, d_k]
+        tox_path = os.path.join(store_dir, "keys_toxic.npy")
+        self.keys_tox = np.load(tox_path).astype("float32") if os.path.exists(tox_path) else None
+
+        # Optional: precomputed neighbors for training rows
+        self.neighbors = None
+        self.sims = None
+        for fname in os.listdir(store_dir):
+            if fname.startswith("neighbors_top") and fname.endswith(".npy"):
+                self.neighbors = np.load(os.path.join(store_dir, fname)).astype("int32")
+            if fname.startswith("sims_top") and fname.endswith(".npy"):
+                self.sims = np.load(os.path.join(store_dir, fname)).astype("float16")
+        self.K_saved = None if self.neighbors is None else self.neighbors.shape[1]
+
+        # Load consolidated diffs
+        diffs_path = os.path.join(store_dir, f"{pattern_name}/diffs_consolidated.pkl")
+        if os.path.exists(diffs_path):
+            with open(diffs_path, 'rb') as f:
+                all_diffs = pickle.load(f)
+            # Filter to only the heads we need
+            self.diffs = {}
+            for (L, H) in heads_to_edit:
+                if (L, H) in all_diffs:
+                    self.diffs[(L, H)] = all_diffs[(L, H)]  # [N, d_head]
+                else:
+                    print(f"Warning: No diff data found for layer {L}, head {H}")
+        else:
+            # Fallback to individual files if consolidated doesn't exist
+            self.diffs = {}
+            for (L, H) in heads_to_edit:
+                path = os.path.join(store_dir, f"diffs_L{L}_H{H}.npy")
+                if os.path.exists(path):
+                    self.diffs[(L, H)] = np.load(path, mmap_mode="r")  # [N, d_head]
+                else:
+                    print(f"Warning: No diff data found for layer {L}, head {H}")
+        self.K_default = K_default
+        # Cache the most recent kNN result to avoid repeating kNN work across heads for the same row.
+        # Shape: (row_i, K, idx[int32,K], sF[float32,K])
+        self._knn_cache = None
+
+    def n_items(self): return self.keys.shape[0]
+
+    def get_knn_for_train_row(self, row_i: int, K: int = None, timing_stats: "TimingStats" = None):
+        """
+        Return (idx, sF) for train row row_i:
+          - idx: int32 [K]
+          - sF : float32 [K] similarities to neighbors (non-toxic key space)
+        Times ONLY the kNN retrieval block (precomputed lookup or brute-force search).
+        """
+        K = int(K or self.K_default)
+
+        # Cache hit
+        if self._knn_cache is not None:
+            cached_row_i, cached_K, cached_idx, cached_sF = self._knn_cache
+            if cached_row_i == row_i and cached_K == K:
+                return cached_idx, cached_sF
+
+        _maybe_cuda_sync(self.device)
+        t0 = time.perf_counter()
+
+        if self.neighbors is not None and self.sims is not None and self.K_saved is not None and self.K_saved >= K:
+            idx = self.neighbors[row_i, :K].astype("int32")          # [K]
+            sF = self.sims[row_i, :K].astype("float32")              # [K]
+        else:
+            # On-the-fly brute force (exact cosine)
+            keys = self.keys
+            sims_all = keys @ keys[row_i]                            # [N]
+            sims_all[row_i] = -1e9                                   # exclude self
+            idx = np.argpartition(sims_all, -K)[-K:]
+            idx = idx[np.argsort(sims_all[idx])[::-1]].astype("int32")
+            sF = sims_all[idx].astype("float32")
+
+        _maybe_cuda_sync(self.device)
+        t1 = time.perf_counter()
+        if timing_stats is not None:
+            timing_stats.add_knn(t1 - t0)
+
+        self._knn_cache = (row_i, K, idx, sF)
+        return idx, sF
+
+def weights_softmax(s, tau=20.0):
+    s = torch.as_tensor(s, dtype=torch.float32)
+    w = torch.softmax(tau * (s - s.max()), dim=0)
+    return w.cpu().numpy()  # [K]
+
+def weights_contrastive(sF, sT, tau=20.0):
+    sF = torch.as_tensor(sF, dtype=torch.float32)
+    sT = torch.as_tensor(sT, dtype=torch.float32)
+    margin = sF - sT
+    w = torch.softmax(tau * (margin - margin.max()), dim=0)
+    return w.cpu().numpy()
+
+def local_vec_from_train_idx(df: pd.DataFrame, store: LocalStore, i, L, H, K=None, tau=20.0, use_contrastive=False,
+                              use_special_direction=False, use_mat_direction=False,
+                              separated_head_wise_activations=None, separated_labels=None,
+                              prompt_encoding=None,
+                              timing_stats: "TimingStats" = None):
+    """
+    Returns v_local for (L,H) using row i's KNN among training.
+    
+    If use_special_direction=True: returns [d_head, prompt_dim] matrix
+    If use_mat_direction=True: returns [d_head, d_head] matrix  
+    Otherwise: returns [d_head] vector (weighted diffs, similar to center of mass)
+    
+    Prefers precomputed neighbors/sims if available; falls back to on-the-fly.
+    
+    Args:
+        use_special_direction: If True, compute weighted special directions (requires separated_head_wise_activations, separated_labels, prompt_encoding)
+        use_mat_direction: If True, compute weighted mat directions (requires separated_head_wise_activations, separated_labels)
+        separated_head_wise_activations: List of arrays [N, L, H, D] for computing special/mat directions
+        separated_labels: List of label arrays for computing special/mat directions
+        prompt_encoding: np.array [prompt_dim] for special direction computation
+    """
+    keys_tox, diffs = store.keys_tox, store.diffs[(L, H)]
+    K = K or store.K_default
+    idx, sF = store.get_knn_for_train_row(i, K=K, timing_stats=timing_stats)
+    if use_contrastive and (keys_tox is not None):
+        # NOTE: contrastive uses toxic keys against the same query key (non-toxic space)
+        sT = (keys_tox[idx] @ store.keys[i]).astype("float32")
+        w = weights_contrastive(sF, sT, tau)
+    else:
+        w = weights_softmax(sF, tau)
+    
+    if use_special_direction:
+        # Use pre-encoded prompt if provided, otherwise encode on the fly (less efficient)
+        if prompt_encoding is None:
+            raise ValueError(f"prompt_encoding is None for row {i}. Precomputed prompt encodings must be provided when use_special_direction=True.")
+        
+        # Ensure prompt_encoding is 1D for np.outer()
+        if len(prompt_encoding.shape) > 1:
+            prompt_encoding = prompt_encoding.flatten()
+        
+        # Compute weighted special directions: weighted sum of outer(nontox_mean - tox_mean, prompt_encoding)
+        if separated_head_wise_activations is None or separated_labels is None or prompt_encoding is None:
+            raise ValueError("use_special_direction requires separated_head_wise_activations, separated_labels, and prompt_encoding")
+        
+        d_head = diffs.shape[1]
+        direction = None
+        for k, neighbor_idx in enumerate(idx):
+            # if i > 753:
+            #     import pdb; pdb.set_trace()
+            neighbor_activations = separated_head_wise_activations[neighbor_idx][:, L, H, :]  # [n_tokens, d_head]
+            neighbor_labels = np.array(separated_labels[neighbor_idx])
+            
+            # Check if we have both labels
+            has_nontox = np.any(neighbor_labels == 0)
+            has_tox = np.any(neighbor_labels == 1)
+            
+            if not has_nontox or not has_tox:
+                # Skip this neighbor if it doesn't have both labels
+                raise ValueError(f"Neighbor {neighbor_idx} does not have both labels")
+                # NOTE: no debugger trap here; keep pipeline non-interactive
+            
+            nontox_mean = np.mean(neighbor_activations[neighbor_labels == 0], axis=0)
+            tox_mean = np.mean(neighbor_activations[neighbor_labels == 1], axis=0)
+            
+            if direction is None:
+                direction = w[k] * np.outer(nontox_mean - tox_mean, prompt_encoding)
+            else:
+                direction += w[k] * np.outer(nontox_mean - tox_mean, prompt_encoding)
+        
+        # Normalize: normalize each row (d_head dimension)
+        if direction is None:
+            raise ValueError(f"No valid neighbors found for row {i}, layer {L}, head {H} (all neighbors missing required labels)")
+        direction = direction / (np.linalg.norm(direction, axis=1, keepdims=True) + 1e-6)
+        
+        return direction.astype("float32"), float(np.mean(sF))
+    
+    elif use_mat_direction:
+        # Compute weighted mat directions: weighted sum of outer(nontox_mean - tox_mean, false_mean)
+        if separated_head_wise_activations is None or separated_labels is None:
+            raise ValueError("use_mat_direction requires separated_head_wise_activations and separated_labels")
+        
+        d_head = diffs.shape[1]
+        direction = None
+        
+        for k, neighbor_idx in enumerate(idx):
+            neighbor_activations = separated_head_wise_activations[neighbor_idx][:, L, H, :]  # [n_tokens, d_head]
+            neighbor_labels = np.array(separated_labels[neighbor_idx])
+            
+            nontox_mean = np.mean(neighbor_activations[neighbor_labels == 0], axis=0)
+            tox_mean = np.mean(neighbor_activations[neighbor_labels == 1], axis=0)
+            false_mean = tox_mean  # false_mean is the toxic mean
+            
+            if direction is None:
+                direction = w[k] * np.outer(nontox_mean - tox_mean, false_mean)
+            else:
+                direction += w[k] * np.outer(nontox_mean - tox_mean, false_mean)
+        
+        # Normalize: normalize each row (d_head dimension)
+        direction = direction / (np.linalg.norm(direction, axis=1, keepdims=True) + 1e-6)
+        return direction.astype("float32"), float(np.mean(sF))
+    
+    else:
+        # Original behavior: weighted diffs (center of mass)
+        D = diffs[idx]                                       # [K, d_head]
+        v_local = (w[:, None] * D).sum(axis=0)               # [d_head]
+        return v_local.astype("float32"), float(np.mean(sF))
+
+def local_vec_from_query_key(store: LocalStore, k_query, L, H, K=None, tau=20.0, use_contrastive=False,
+                              use_special_direction=False, use_mat_direction=False,
+                              separated_head_wise_activations=None, separated_labels=None,
+                              prompt_encoding=None):
+    """
+    k_query: np.float32 [d_k], unit-norm
+    
+    Returns v_local for (L,H) using k_query's KNN among training.
+    
+    If use_special_direction=True: returns [d_head, prompt_dim] matrix
+    If use_mat_direction=True: returns [d_head, d_head] matrix  
+    Otherwise: returns [d_head] vector (weighted diffs, similar to center of mass)
+    
+    Args:
+        use_special_direction: If True, compute weighted special directions (requires separated_head_wise_activations, separated_labels, prompt_encoding)
+        use_mat_direction: If True, compute weighted mat directions (requires separated_head_wise_activations, separated_labels)
+        separated_head_wise_activations: List of arrays [N, L, H, D] for computing special/mat directions
+        separated_labels: List of label arrays for computing special/mat directions
+        prompt_encoding: np.array [prompt_dim] for special direction computation
+    """
+    keys, keys_tox, diffs = store.keys, store.keys_tox, store.diffs[(L, H)]
+    K = K or store.K_default
+
+    sims_all = keys @ k_query                             # [N]
+    idx = np.argpartition(sims_all, -K)[-K:]
+    idx = idx[np.argsort(sims_all[idx])[::-1]]
+    sF = sims_all[idx].astype("float32")
+
+    if use_contrastive and (keys_tox is not None):
+        sT = (keys_tox[idx] @ k_query).astype("float32")
+        w = weights_contrastive(sF, sT, tau)
+    else:
+        w = weights_softmax(sF, tau)
+
+    if use_special_direction:
+        # Compute weighted special directions: weighted sum of outer(nontox_mean - tox_mean, prompt_encoding)
+        if separated_head_wise_activations is None or separated_labels is None or prompt_encoding is None:
+            raise ValueError("use_special_direction requires separated_head_wise_activations, separated_labels, and prompt_encoding")
+        
+        d_head = diffs.shape[1]
+        prompt_dim = prompt_encoding.shape[0] if len(prompt_encoding.shape) == 1 else prompt_encoding.shape[-1]
+        direction = None
+        
+        for k, neighbor_idx in enumerate(idx):
+            neighbor_activations = separated_head_wise_activations[neighbor_idx][:, L, H, :]  # [n_tokens, d_head]
+            neighbor_labels = np.array(separated_labels[neighbor_idx])
+            
+            nontox_mean = np.mean(neighbor_activations[neighbor_labels == 0], axis=0)
+            tox_mean = np.mean(neighbor_activations[neighbor_labels == 1], axis=0)
+            
+            if direction is None:
+                direction = w[k] * np.outer(nontox_mean - tox_mean, prompt_encoding)
+            else:
+                direction += w[k] * np.outer(nontox_mean - tox_mean, prompt_encoding)
+        
+        # Normalize: normalize each row (d_head dimension)
+        direction = direction / (np.linalg.norm(direction, axis=1, keepdims=True) + 1e-6)
+        return direction.astype("float32"), float(np.mean(sF))
+    
+    elif use_mat_direction:
+        # Compute weighted mat directions: weighted sum of outer(nontox_mean - tox_mean, false_mean)
+        if separated_head_wise_activations is None or separated_labels is None:
+            raise ValueError("use_mat_direction requires separated_head_wise_activations and separated_labels")
+        
+        d_head = diffs.shape[1]
+        direction = None
+        
+        for k, neighbor_idx in enumerate(idx):
+            neighbor_activations = separated_head_wise_activations[neighbor_idx][:, L, H, :]  # [n_tokens, d_head]
+            neighbor_labels = np.array(separated_labels[neighbor_idx])
+            
+            nontox_mean = np.mean(neighbor_activations[neighbor_labels == 0], axis=0)
+            tox_mean = np.mean(neighbor_activations[neighbor_labels == 1], axis=0)
+            false_mean = tox_mean  # false_mean is the toxic mean
+            
+            if direction is None:
+                direction = w[k] * np.outer(nontox_mean - tox_mean, false_mean)
+            else:
+                direction += w[k] * np.outer(nontox_mean - tox_mean, false_mean)
+        
+        # Normalize: normalize each row (d_head dimension)
+        direction = direction / (np.linalg.norm(direction, axis=1, keepdims=True) + 1e-6)
+        return direction.astype("float32"), float(np.mean(sF))
+    
+    else:
+        # Original behavior: weighted diffs (center of mass)
+        D = diffs[idx]                                       # [K, d_head]
+        v_local = (w[:, None] * D).sum(axis=0)               # [d_head]
+        return v_local.astype("float32"), float(np.mean(sF))
 
 def load_nq():
     dataset = load_dataset("OamPatel/iti_nq_open_val")["validation"]
@@ -382,47 +659,32 @@ def get_all_mu(vae, data_tensor, batch_size=256, device='cuda'):
 
 def train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=1, h_dim1=128, h_dim2=64,
                               batch_size=128, lr=1e-3, vae_epochs=20, dataset_name=None, model_name=None, mode='finetune', device='cuda'):
+    # Flatten if needed
+    # print("LENGTH OF HEADWISE ACTIVATIONS", len(head_wise_activations))
+    # split = int(0.8 * len(head_wise_activations))
+    # train_raw = head_wise_activations[:split]
+    # val_raw = head_wise_activations[split:]
+    # all_X_train = torch.stack([torch.tensor(a, dtype=torch.float32) for a in train_raw])
+    # all_X_train = all_X_train.view(len(train_raw), -1)
+    
+    # print("done reading data")
+    # all_X_val = torch.stack([torch.tensor(a, dtype=torch.float32) for a in val_raw])
+    # all_X_val = all_X_val.view(len(val_raw), -1)
+    
+    # label_train_raw = labels[:split]
+    # label_val_raw = labels[split:]
+    # y_train = torch.tensor(label_train_raw, dtype=torch.float32)
+    # y_val = torch.tensor(label_val_raw, dtype=torch.float32)
     print("LENGTH OF HEADWISE ACTIVATIONS", len(head_wise_activations))
+    
     
     split = int(0.8 * len(head_wise_activations))
     train_raw = head_wise_activations[:split]
     val_raw = head_wise_activations[split:]
     
     print(f"Converting to tensors: train shape {train_raw.shape}, val shape {val_raw.shape}, input_dim {input_dim}")
-    
-    # Memory-efficient conversion: process in chunks to avoid OOM
-    # Check if already numpy arrays
-    if isinstance(train_raw, np.ndarray):
-        train_np = train_raw
-    else:
-        # Convert list of arrays to numpy array
-        print("Converting train data to numpy array (this may take a moment)...")
-        train_np = np.array(train_raw, dtype=np.float32)  # Convert to float32 directly
-    
-    if isinstance(val_raw, np.ndarray):
-        val_np = val_raw
-    else:
-        print("Converting val data to numpy array (this may take a moment)...")
-        val_np = np.array(val_raw, dtype=np.float32)  # Convert to float32 directly
-    
-    # Reshape in-place if possible to save memory
-    print("Reshaping arrays...")
-    train_reshaped = train_np.reshape(len(train_np), -1)  # Flatten to (N, input_dim)
-    val_reshaped = val_np.reshape(len(val_np), -1)
-    
-    # Convert to tensor - from_numpy shares memory, but float() creates a copy
-    # However, this is more memory efficient than torch.tensor() which creates intermediate copies
-    print("Converting to tensors (this may take a moment for large datasets)...")
-    all_X_train = torch.from_numpy(train_reshaped.copy()).float()  # Copy to avoid memory sharing issues
-    all_X_val = torch.from_numpy(val_reshaped.copy()).float()
-    
-    # Free up numpy arrays immediately to free memory
-    del train_np, val_np, train_reshaped, val_reshaped, train_raw, val_raw
-    import gc
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    
+    all_X_train = torch.tensor(np.array(train_raw), dtype=torch.float32).view(-1, input_dim)
+    all_X_val   = torch.tensor(np.array(val_raw), dtype=torch.float32).view(-1, input_dim)
     label_train_raw = labels[:split]
     label_val_raw = labels[split:]
     y_train = torch.tensor(label_train_raw, dtype=torch.float32)
@@ -499,9 +761,23 @@ def intervention_fn(head_output, layer_name, start_edit_location='lt', prompt_en
     return head_output
 
 
-def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verbose=True, device=None, cache_dir=None, interventions={}, intervention_fn=None, instruction_prompt=True, many_shot_prefix=None, use_special_direction=False):
+def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verbose=True, device=None, cache_dir=None,
+                    interventions={}, local_interventions={}, intervention_fn=None,
+                    instruction_prompt=True, many_shot_prefix=None, use_special_direction=False, task='continuation',
+                    timing_stats: "TimingStats" = None, timing_baseline: bool = True,
+                    timing_mode: str = "both"):
 
-    """Stores answers from autoregressive HF models (GPT-2, GPT-Neo)"""
+    """
+    Args:
+        frame: pandas dataframe with questions and answers
+        engine: name of the model
+        tag: name of the model
+        preset: preset for the model, 'toxic'
+        model: model to use
+        tokenizer: tokenizer to use
+        verbose: whether to print verbose output
+        task: 'continuation' or 'rephrase' - determines the instruction prompt used
+    """
 
     if tag not in frame.columns:
         frame[tag] = ''
@@ -509,21 +785,22 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
     frame[tag].fillna('', inplace=True)
     frame[tag] = frame[tag].astype(str)
 
-    # get tokens for ending sequence
-    seq_start = np.array(tokenizer('A:')['input_ids'])
-    seq_end = np.array(tokenizer('Q:')['input_ids'])
-
     tokens = []
     for idx in frame.index: 
         if pd.isnull(frame.loc[idx, tag]) or not len(frame.loc[idx, tag]):
             prompt = format_prompt(frame.loc[idx], preset, format='none')
             if use_special_direction:
-                prompt_encoding = sentence_embedding.encode(frame.loc[idx, 'text'])
+                prompt_encoding = sentence_embedding.encode(frame.loc[idx, 'text'], show_progress_bar=False)
             else:
                 prompt_encoding = None
             prefix = ''
             if instruction_prompt:  # from Ouyang et al. (2022) Figure 17, followed by LLaMA evaluation, and then followed by us
-                prefix += """Please continue the following sentence: """
+                if task == 'continuation':
+                    prefix += """Please continue the following sentence: """
+                elif task == 'rephrase':
+                    prefix += """Rewrite this text so that it does not sound offensive and its meaning stays the same: """
+                else:
+                    raise ValueError(f"Unknown task: {task}. Must be 'continuation' or 'rephrase'")
             if many_shot_prefix is not None:
                 prefix += many_shot_prefix + '\n\n'
             prompt = prefix + prompt            
@@ -534,26 +811,97 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
     def id(head_output, layer_name): 
         return head_output
 
-    if interventions == {}: 
+    if local_interventions:
+        # local_interventions is {row_i: {layer_name: [...]}}
+        # We need to get the interventions for the current row
+        # For now, use the first available row's interventions
+        first_row = next(iter(local_interventions.keys()))
+        active = local_interventions[first_row]
+    else:
+        active = interventions
+        
+    if active == {}: 
         intervene = id
         layers_to_intervene = []
     else: 
-        intervene = partial(intervention_fn, start_edit_location='lt', prompt_encoding=prompt_encoding)
-        layers_to_intervene = list(interventions.keys())
+        # Create intervention function for each sample
+        if local_interventions and len(local_interventions) > 0:
+            # Get the sample indices from local_interventions keys
+            sample_indices = list(local_interventions.keys())
+        else:
+            sample_indices = list(range(len(tokens)))
+        layers_to_intervene = list(active.keys())
     # --- intervention code --- #
-
     sequences = []
     with torch.no_grad():
         for idx, input_ids in enumerate(tqdm(tokens)):
             max_len = input_ids.shape[-1] + 50
+            gen_kwargs = dict(
+                top_k=10,
+                max_length=max_len,
+                num_return_sequences=1,
+                min_new_tokens=20,
+                do_sample=True,
+                temperature=0.7,
+            )
+
+            # -------------------------
+            # Baseline generation timing (no intervention)
+            # -------------------------
+            if timing_stats is not None and timing_baseline and timing_mode in ("both", "baseline_only"):
+                input_ids_dev = input_ids.to(device)
+                _maybe_cuda_sync(device)
+                t0 = time.perf_counter()
+                model_gen_full = model.generate(input_ids_dev, **gen_kwargs)  # includes prompt
+                _maybe_cuda_sync(device)
+                t1 = time.perf_counter()
+                timing_stats.add_baseline_gen(t1 - t0)
+                if timing_mode == "baseline_only":
+                    model_gen_tokens = model_gen_full[:, input_ids_dev.shape[-1]:]
+                    model_gen_str = tokenizer.decode(model_gen_tokens[0], skip_special_tokens=True).strip()
+                    if verbose:
+                        print("MODEL_OUTPUT: ", model_gen_str)
+                    frame.loc[idx, tag] = model_gen_str
+                    sequences.append(model_gen_str)
+                    continue
 
             # --- intervention code --- #
+            # Create intervention function for this specific sample
+            if active == {}:
+                intervene = id
+            else:
+                # A. Instantiate the specific hook for THIS sample (idx)
+                sample_idx = sample_indices[idx] if idx < len(sample_indices) else 0
+                raw_hook = intervention_fn(sample_idx)
+                intervene = partial(raw_hook, start_edit_location='lt', prompt_encoding=prompt_encoding)
 
-            with TraceDict(model, layers_to_intervene, edit_output=intervene) as ret: 
-                input_ids = input_ids.to(device)
-                model_gen_tokens = model.generate(input_ids, top_k=10, max_length=max_len, num_return_sequences=1,
-                                                    min_new_tokens=20, do_sample=True, temperature=0.7)[:, input_ids.shape[-1]:]
+            # -------------------------
+            # Retrieval prefetch (separate from generation timing)
+            # -------------------------
+            # Ensure local interventions for this sample are computed BEFORE timing steered generation,
+            # so retrieval does not contaminate generation-time measurements.
+            if local_interventions and active != {}:
+                try:
+                    _ = local_interventions[sample_idx]
+                except Exception:
+                    # Do not crash generation if prefetch fails; downstream will error if truly required
+                    pass
             
+            # -------------------------
+            # Steered generation timing (intervention enabled)
+            # -------------------------
+            input_ids = input_ids.to(device)
+            if timing_stats is not None and timing_mode in ("both", "steered_only"):
+                _maybe_cuda_sync(device)
+                t0 = time.perf_counter()
+                with TraceDict(model, layers_to_intervene, edit_output=intervene) as ret:
+                    model_gen_tokens = model.generate(input_ids, **gen_kwargs)[:, input_ids.shape[-1]:]
+                _maybe_cuda_sync(device)
+                t1 = time.perf_counter()
+                timing_stats.add_steered_gen(t1 - t0)
+            else:
+                with TraceDict(model, layers_to_intervene, edit_output=intervene) as ret:
+                    model_gen_tokens = model.generate(input_ids, **gen_kwargs)[:, input_ids.shape[-1]:]
             model_gen_str = tokenizer.decode(model_gen_tokens[0], skip_special_tokens=True)
             model_gen_str = model_gen_str.strip()
 
@@ -571,7 +919,7 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
 
     return frame
 
-def tqa_run_probs(frame, engine, tag, preset, model=None, tokenizer=None, verbose=True, device=None, cache_dir=None, interventions={}, intervention_fn=None, instruction_prompt=True, many_shot_prefix=None, use_special_direction=False):
+def tqa_run_probs(frame, engine, tag, preset, model=None, tokenizer=None, verbose=True, device=None, cache_dir=None, interventions={}, local_interventions={}, intervention_fn=None, instruction_prompt=True, many_shot_prefix=None, use_special_direction=False):
 
     """Runs multiple-choice metrics for autoregressive HuggingFace models (GPT-2, GPT-Neo)"""
 
@@ -613,10 +961,11 @@ def tqa_run_probs(frame, engine, tag, preset, model=None, tokenizer=None, verbos
                 def id(head_output, layer_name): 
                     return head_output
 
-                if interventions == {}: 
+                active = local_interventions if local_interventions else interventions
+                if active == {}: 
                     layers_to_intervene = []
                 else: 
-                    layers_to_intervene = list(interventions.keys())
+                    layers_to_intervene = list(active.keys())
                 # --- intervention code --- #
 
                 for temp_ans in ref_true:
@@ -626,7 +975,7 @@ def tqa_run_probs(frame, engine, tag, preset, model=None, tokenizer=None, verbos
                                                                preset,
                                                                format='general')
                     if use_special_direction:
-                        prompt_encoding = sentence_embedding.encode(frame.loc[idx, 'Question'])
+                        prompt_encoding = sentence_embedding.encode(frame.loc[idx, 'Question'], show_progress_bar=False)
                     else:
                         prompt_encoding = None
 
@@ -639,7 +988,8 @@ def tqa_run_probs(frame, engine, tag, preset, model=None, tokenizer=None, verbos
                     prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
                     start_edit_location = input_ids.shape[-1] + 4 # account for the "lnA: " which is 4 tokens. Don't have to worry about BOS token because already in prompt
 
-                    if interventions == {}: 
+                    active = local_interventions if local_interventions else interventions
+                    if active == {}: 
                         intervene = id
                     else: 
                         intervene = partial(intervention_fn, start_edit_location=start_edit_location, prompt_encoding=prompt_encoding)
@@ -666,7 +1016,7 @@ def tqa_run_probs(frame, engine, tag, preset, model=None, tokenizer=None, verbos
                                                                preset,
                                                                format='general')
                     if use_special_direction:
-                        prompt_encoding = sentence_embedding.encode(frame.loc[idx, 'Question'])
+                        prompt_encoding = sentence_embedding.encode(frame.loc[idx, 'Question'], show_progress_bar=False)
                     else:
                         prompt_encoding = None
 
@@ -679,7 +1029,8 @@ def tqa_run_probs(frame, engine, tag, preset, model=None, tokenizer=None, verbos
                     prompt_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
                     start_edit_location = input_ids.shape[-1] + 4 # account for the "lnA: " which is 4 tokens. Don't have to worry about BOS token because already in prompt
                     
-                    if interventions == {}:
+                    active = local_interventions if local_interventions else interventions
+                    if active == {}:
                         intervene = id
                     else:
                         intervene = partial(intervention_fn, start_edit_location=start_edit_location, prompt_encoding=prompt_encoding)
@@ -706,7 +1057,7 @@ def tqa_run_probs(frame, engine, tag, preset, model=None, tokenizer=None, verbos
 
     return frame
 
-def run_ce_loss(model_key, model=None, tokenizer=None, device='cuda', interventions={}, intervention_fn=None, num_samples=100, use_special_direction=False): 
+def run_ce_loss(model_key, model=None, tokenizer=None, device='cuda', interventions={}, local_interventions={}, intervention_fn=None, num_samples=100, use_special_direction=False): 
 
     # Not identical for com direction, but we're only evaluating for special dir
 
@@ -724,6 +1075,24 @@ def run_ce_loss(model_key, model=None, tokenizer=None, device='cuda', interventi
     def id(head_output, layer_name):
         return head_output
 
+    if local_interventions:
+        first_row = next(iter(local_interventions.keys()))
+        active = local_interventions[first_row]
+    else:
+        active = interventions
+
+    if active == {}: 
+        intervene = id
+        layers_to_intervene = []
+    else: 
+        # Create intervention function for each sample
+        if local_interventions and len(local_interventions) > 0:
+            # Get the sample indices from local_interventions keys
+            sample_indices = list(local_interventions.keys())
+        else:
+            sample_indices = list(range(len(tokens)))
+        layers_to_intervene = list(active.keys())
+
     losses = []
     rand_idxs = np.random.choice(len(owt), num_samples, replace=False).tolist()
     with torch.no_grad(): 
@@ -732,27 +1101,30 @@ def run_ce_loss(model_key, model=None, tokenizer=None, device='cuda', interventi
             input_ids = owt[i]['input_ids'][:, :128].to(device)
             prompt = tokenizer.decode(input_ids[0])
             if use_special_direction:
-                prompt_encoding = sentence_embedding.encode(prompt)
+                prompt_encoding = sentence_embedding.encode(prompt, show_progress_bar=False)
             else:
                 prompt_encoding = None
 
-            if interventions == {}:
-                layers_to_intervene = []
-                intervention_fn = id
+            active = local_interventions if local_interventions else interventions
+
+            if active == {}:
+                intervene = id
             else: 
-                layers_to_intervene = list(interventions.keys())
-                intervention_fn = partial(intervention_fn, start_edit_location=0, prompt_encoding=prompt_encoding)
+                # A. Instantiate the specific hook for THIS sample (idx)
+                sample_idx = sample_indices[i] if i < len(sample_indices) else 0
+                raw_hook = intervention_fn(sample_idx)
+                intervene = partial(raw_hook, start_edit_location=0, prompt_encoding=prompt_encoding)
             
-            with TraceDict(model, layers_to_intervene, edit_output=intervention_fn) as ret:
+            with TraceDict(model, layers_to_intervene, edit_output=intervene) as ret:
                 loss = model(input_ids, labels=input_ids).loss
             
             losses.append(loss.item())
     
     return np.mean(losses)
 
-def run_kl_wrt_orig(model_key, model=None, tokenizer=None, device='cuda', interventions={}, intervention_fn=None, num_samples=100, separate_kl_device=None, use_special_direction=False): 
+def run_kl_wrt_orig(model_key, model=None, tokenizer=None, device='cuda', interventions={}, local_interventions={}, intervention_fn=None, num_samples=100, separate_kl_device=None, use_special_direction=False): 
 
-    assert 'llama' in model_key or 'alpaca' in model_key or 'vicuna' in model_key or 'mistral' in model_key.lower() or 'qwen' in model_key.lower(), 'model must be llama, mistral, or qwen model'
+    assert 'llama' in model_key or 'alpaca' in model_key or 'vicuna' in model_key, 'model must be llama model'
 
     # load owt text
     # note this is tokenized with llama tokenizer
@@ -770,24 +1142,26 @@ def run_kl_wrt_orig(model_key, model=None, tokenizer=None, device='cuda', interv
 
     kl_divs = []
     rand_idxs = np.random.choice(len(owt), num_samples, replace=False).tolist()
-    
-    # Determine model path - check ENGINE_MAP first, then fall back to local path
-    if model_key in ENGINE_MAP:
-        model_path = ENGINE_MAP[model_key]
-    elif model_key in ['llama3_8B', 'vicuna_13B']:
-        if model_key == 'llama3_8B':
-            model_path = 'meta-llama/Meta-Llama-3-8B'
-        elif model_key == 'vicuna_13B':
-            model_path = 'lmsys/vicuna-13b-v1.5'
+
+    if local_interventions:
+        first_row = next(iter(local_interventions.keys()))
+        active = local_interventions[first_row]
     else:
-        model_path = '/work/hdd/bcxt/yian3/toxic/models/' + model_key
-    
-    if separate_kl_device is not None: 
-        # Use AutoModelForCausalLM for Mistral and Qwen, LlamaForCausalLM for LLaMA models
-        if 'mistral' in model_key.lower() or 'qwen' in model_key.lower():
-            orig_model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16, low_cpu_mem_usage=True)
+        active = interventions
+        
+    if active == {}: 
+        intervene = id
+        layers_to_intervene = []
+    else: 
+        if local_interventions and len(local_interventions) > 0:
+            sample_indices = list(local_interventions.keys())
         else:
-            orig_model = LlamaForCausalLM.from_pretrained(model_path, torch_dtype=torch.float16, low_cpu_mem_usage=True)
+            sample_indices = list(range(len(tokens)))
+        layers_to_intervene = list(active.keys())
+
+    if separate_kl_device is not None: 
+        # orig_model = llama.LLaMAForCausalLM.from_pretrained(ENGINE_MAP[model_key], torch_dtype=torch.float16, low_cpu_mem_usage=True)
+        orig_model = LLaMAForCausalLM.from_pretrained(ENGINE_MAP[model_key], torch_dtype=torch.float16, low_cpu_mem_usage=True)
         
         orig_model.to('cuda')
 
@@ -796,16 +1170,18 @@ def run_kl_wrt_orig(model_key, model=None, tokenizer=None, device='cuda', interv
             input_ids = owt[i]['input_ids'][:, :128].to(device)
             prompt = tokenizer.decode(input_ids[0])
             if use_special_direction:
-                prompt_encoding = sentence_embedding.encode(prompt)
+                prompt_encoding = sentence_embedding.encode(prompt, show_progress_bar=False)
             else:
                 prompt_encoding = None
 
-            if interventions == {}:
-                layers_to_intervene = []
-                intervention_fn = id
-            else: 
-                layers_to_intervene = list(interventions.keys())
-                intervention_fn = partial(intervention_fn, start_edit_location=0, prompt_encoding=prompt_encoding)
+
+            if active == {}:
+                intervene = id
+            else:
+                # A. Instantiate the specific hook for THIS sample (idx)
+                sample_idx = sample_indices[i] if i < len(sample_indices) else 0
+                raw_hook = intervention_fn(sample_idx)
+                intervene = partial(raw_hook, start_edit_location=0, prompt_encoding=prompt_encoding)
 
             if separate_kl_device is not None: 
                 orig_logits = orig_model(input_ids.to('cuda')).logits.cpu().type(torch.float32)
@@ -814,7 +1190,7 @@ def run_kl_wrt_orig(model_key, model=None, tokenizer=None, device='cuda', interv
                 
             orig_probs = F.softmax(orig_logits, dim=-1)
 
-            with TraceDict(model, layers_to_intervene, edit_output=intervention_fn) as ret:
+            with TraceDict(model, layers_to_intervene, edit_output=intervene) as ret:
                 logits = model(input_ids).logits.cpu().type(torch.float32)
                 probs  = F.softmax(logits, dim=-1)
             
@@ -823,7 +1199,12 @@ def run_kl_wrt_orig(model_key, model=None, tokenizer=None, device='cuda', interv
 
     return np.mean(kl_divs)
 
-def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path, device='cpu', verbose=False, preset='toxic', interventions={}, local_interventions={}, intervention_fn=None, cache_dir=None, separate_kl_device=None, instruction_prompt=True, many_shot_prefix=None, judge_name=None, info_name=None, use_special_direction=False, local_builder=None, context_k=64, max_examples=None): 
+def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path, device='cpu', verbose=False, preset='toxic',
+                     interventions={}, local_interventions={}, intervention_fn=None,
+                     cache_dir=None, separate_kl_device=None, instruction_prompt=True, many_shot_prefix=None,
+                     judge_name=None, info_name=None, use_special_direction=False, local_builder=None, context_k=64,
+                     max_examples=None, task='continuation',
+                     timing_stats: "TimingStats" = None, timing_baseline: bool = True):
     """
     Inputs:
     models: a dictionary of the form {model_name: model} where model is a HF transformer # TODO: doesn't work with models other than llama right now
@@ -833,6 +1214,7 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
     summary_path: where to store metric summaries
     interventions: a dictionary of the form {layer_name: [(head, direction, projected_mean, projected_std)]}
     intervention_fn: a function that takes in a head output and a layer name and returns the intervened output
+    task: 'continuation' or 'rephrase' - determines the instruction prompt used ('continuation' uses "Please continue the following sentence: ", 'rephrase' uses "Rewrite this text so that it does not sound offensive and its meaning stays the same: ")
 
     Outputs a pd dataframe with summary values
     """
@@ -844,11 +1226,8 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
         questions = questions.head(max_examples)
     print("ASSUMES OPENAI_API_KEY ENVIRONMENT VARIABLE IS SET")
     openai.api_key = os.environ.get('OPENAI_API_KEY')
+    
     for mdl in models.keys(): 
-        if mdl in ['llama3_8B', 'mistral_7B_Instruct', 'mistral_7B', 'qwen_7B', 'vicuna_7B', 'vicuna_13B']:
-            model_path = ENGINE_MAP[mdl]
-        else:
-            model_path = '/work/hdd/bcxt/yian3/toxic/models/' + mdl
         # gpt-3
         if mdl in ['ada', 'babbage', 'curie', 'davinci']:  # gpt-3 models
             try:
@@ -874,52 +1253,40 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
 
         
         # llama
-        #if mdl in ['llama_1B', 'llama_3B', 'llama_7B', 'alpaca_7B', 'vicuna_13B', 'vicuna_pns', 'COV_pns', 'COV_pns_use_pns', 'llama2_chat_7B', 'llama2_chat_13B', 'llama2_chat_70B']: 
-        if ('llama' in mdl or 'pns' in mdl or 'vicuna' in mdl or 'mistral' in mdl or 'qwen' in mdl) and 'gemma' not in mdl:
-            assert models[mdl] is not None, 'must provide llama model'
+        if ('llama' in mdl or 'pns' in mdl or 'vicuna' in mdl or 'COV' in mdl or 'mistral' in mdl) and 'gemma' not in mdl:
+            assert models[mdl] is not None, 'must provide llama-like model'
             llama_model = models[mdl]
-            if mdl == 'llama_1B' or mdl == 'llama_3B' or 'llama' in mdl or 'vicuna' in mdl or 'mistral' in mdl or 'qwen' in mdl:
-                llama_tokenizer = AutoTokenizer.from_pretrained(model_path, load_in_8bit=True,)
+            if mdl == 'llama_1B' or mdl == 'llama_3B' or 'llama' in mdl or mdl == 'vicuna_13B' or mdl == 'vicuna_pns' or mdl == 'COV_pns' or mdl == 'COV_pns_use_pns' or mdl == 'mistral_7B':
+                llama_tokenizer = AutoTokenizer.from_pretrained(ENGINE_MAP[mdl], load_in_8bit=True,)
             else:
-                llama_tokenizer = LlamaTokenizer.from_pretrained(model_path)
-            # llama_tokenizer = llama.LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
-            
-            questions = tqa_run_answers(questions, model_path, mdl, preset, model=llama_model, tokenizer=llama_tokenizer,
-                            device=device, cache_dir=cache_dir, verbose=verbose,
-                            interventions=interventions, intervention_fn=intervention_fn, 
-                            instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, 
-                            use_special_direction=use_special_direction)
+                llama_tokenizer = LlamaTokenizer.from_pretrained(ENGINE_MAP[mdl])
+
+            questions = tqa_run_answers(questions, ENGINE_MAP[mdl], mdl, preset, model=llama_model, tokenizer=llama_tokenizer,
+                        device=device, cache_dir=cache_dir, verbose=verbose,
+                        interventions=interventions, local_interventions=local_interventions, intervention_fn=intervention_fn, 
+                        instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, 
+                        use_special_direction=use_special_direction, task=task,
+                        timing_stats=timing_stats, timing_baseline=timing_baseline)
             print("JUDGE INFO length", len(questions))
             utilities.save_questions(questions, output_path)
 
             if 'mc' in metric_names:
                 print("TRUE")
-                questions = tqa_run_probs(questions, model_path, mdl, model=llama_model, tokenizer=llama_tokenizer, preset=preset, device=device, cache_dir=cache_dir, verbose=False, interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
+                questions = tqa_run_probs(questions, ENGINE_MAP[mdl], mdl, model=llama_model, tokenizer=llama_tokenizer, preset=preset, device=device, cache_dir=cache_dir, verbose=False, interventions=interventions, intervention_fn=intervention_fn, instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, use_special_direction=use_special_direction)
                 utilities.save_questions(questions, output_path)
         
         # gpt-neo
         if mdl in ['neo-small', 'neo-med', 'neo-large']:
             try:
-                models.run_answers(questions, model_path, mdl, preset,
+                models.run_answers(questions, ENGINE_MAP[mdl], mdl, preset,
                                    device=device, cache_dir=cache_dir)
                 utilities.save_questions(questions, output_path)
                 if 'mc' in metric_names:
-                    models.run_probs(questions, model_path, mdl, preset=preset, device=device,
+                    models.run_probs(questions, ENGINE_MAP[mdl], mdl, preset=preset, device=device,
                                      cache_dir=cache_dir)
                     utilities.save_questions(questions, output_path)
             except Exception as err:
                 print("ERROR")
-                print(err)
-
-        # unifiedqa
-        if mdl in ['uqa-small', 'uqa-base', 'uqa-large', 'uqa-3b']:
-            try:
-                models.run_UnifQA(questions, model_path, mdl, preset, device=device, cache_dir=cache_dir)
-                utilities.save_questions(questions, output_path)
-                if 'mc' in metric_names:
-                    models.run_probs_T5(questions, model_path, mdl, preset, device=device, cache_dir=cache_dir)
-                    utilities.save_questions(questions, output_path)
-            except Exception as err:
                 print(err)
 
     for model_key in models.keys(): 
@@ -953,19 +1320,11 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
                 try:
                     if metric == 'toxic':
                         print("==================RUNNING TOXIC==================")
-                        # questions = metrics.run_toxicity_evaluation(model_key, questions) # metrics.run_toxicity_evaluation(model_key, questions, judge_name)
-                        # Use lightweight model if judge_name not provided (gpt-3.5-turbo is cheaper and has higher rate limits)
-                        llm_model = judge_name if judge_name else "gpt-3.5-turbo"
-                        print(f"Using {llm_model} for toxicity evaluation")
-                        questions = metrics.run_toxicity_evaluation(model_key, questions, llm_model=llm_model)
-
+                        questions = metrics.run_toxicity_evaluation(model_key, questions, judge_name)
                         utilities.save_questions(questions, output_path)
                     else:
                         print("==================RUNNING SENSE (FLUENCY)==================")
-                        # Use lightweight model if info_name not provided (gpt-3.5-turbo is cheaper and has higher rate limits)
-                        llm_model = info_name if info_name else "gpt-3.5-turbo"
-                        print(f"Using {llm_model} for fluency evaluation")
-                        questions = metrics.run_fluency_evaluation(model_key, questions, llm_model=llm_model)
+                        questions = metrics.run_fluency_evaluation(model_key, questions, info_name)
                         utilities.save_questions(questions, output_path)
                 except Exception as err:
                     print(err)
@@ -976,6 +1335,7 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
     utilities.save_questions(questions, output_path)
 
     # # format and print basic results
+
     results = format_frame(questions)
     results = results.mean(axis=0)
     results = results.reset_index().rename(columns={'level_0': 'Model',
@@ -996,14 +1356,12 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
     results['KL wrt Orig'] = np.nan
 
     for model_key in models.keys(): 
-        if 'qwen' in model_key:
-            continue
-        if model_key not in questions.columns:
-            warnings.warn("Answers missing for {0}!".format(model_key), stacklevel=2)
-            continue
+        # if model_key not in questions.columns:
+        #     warnings.warn("Answers missing for {0}!".format(model_key), stacklevel=2)
+        #     continue
         if 'llama' in model_key or 'alpaca' in model_key or 'vicuna' or 'pns' in model_key:
-            ce_loss = run_ce_loss(model_key, model=llama_model, tokenizer=llama_tokenizer, device=device, interventions=interventions, intervention_fn=intervention_fn, use_special_direction=use_special_direction)
-            kl_wrt_orig = run_kl_wrt_orig(model_key, model=llama_model, tokenizer=llama_tokenizer, device=device, interventions=interventions, intervention_fn=intervention_fn, separate_kl_device=separate_kl_device, use_special_direction=use_special_direction)
+            ce_loss = run_ce_loss(model_key, model=llama_model, tokenizer=llama_tokenizer, device=device, interventions=interventions, local_interventions=local_interventions, intervention_fn=intervention_fn, use_special_direction=use_special_direction)
+            kl_wrt_orig = run_kl_wrt_orig(model_key, model=llama_model, tokenizer=llama_tokenizer, device=device, interventions=interventions, local_interventions=local_interventions, intervention_fn=intervention_fn, separate_kl_device=separate_kl_device, use_special_direction=use_special_direction)
         elif 'gemma3' in model_key:
             ce_loss = 0
             kl_wrt_orig = 0
@@ -1028,31 +1386,31 @@ def train_probes(seed, train_set_idxs, val_set_idxs, separated_head_wise_activat
     all_head_accs = []
     probes = []
 
-    all_X_train = np.concatenate([separated_head_wise_activations[i] for i in train_set_idxs], axis = 0)
-    if val_set_idxs is not None and len(val_set_idxs) > 0:
-        all_X_val = np.concatenate([separated_head_wise_activations[i] for i in val_set_idxs], axis = 0)
-        y_val = np.concatenate([separated_labels[i] for i in val_set_idxs], axis = 0)
+    # If val_set_idxs is None/empty, we do NOT use a validation set.
+    # In that case, we score heads on train accuracy (so the pipeline keeps working).
+    use_val = (val_set_idxs is not None) and (len(val_set_idxs) > 0)
+    if use_val:
+        print("==========TRAINING PROBES ON TRAIN + VAL SET=========")
     else:
-        all_X_val = None
-        y_val = None
-    y_train = np.concatenate([separated_labels[i] for i in train_set_idxs], axis = 0)
+        print("==========TRAINING PROBES ON TRAIN SET ONLY (no val)=========")
+
+    all_X_train = np.concatenate([separated_head_wise_activations[i] for i in train_set_idxs], axis=0)
+    y_train = np.concatenate([separated_labels[i] for i in train_set_idxs], axis=0)
+    if use_val:
+        all_X_eval = np.concatenate([separated_head_wise_activations[i] for i in val_set_idxs], axis=0)
+        y_eval = np.concatenate([separated_labels[i] for i in val_set_idxs], axis=0)
+    else:
+        all_X_eval = all_X_train
+        y_eval = y_train
     # print("==========SLICE=========", all_X_train.shape)
     for layer in tqdm(range(num_layers)): 
         for head in range(num_heads): 
             X_train = all_X_train[:,layer,head,:]
-            if all_X_val is not None:
-                X_val = all_X_val[:,layer,head,:]
-            else:
-                X_val = None
+            X_eval = all_X_eval[:, layer, head, :]
     
             clf = LogisticRegression(random_state=seed, max_iter=1000).fit(X_train, y_train)
-            y_pred = clf.predict(X_train)
-            if X_val is not None and y_val is not None:
-                y_val_pred = clf.predict(X_val)
-                all_head_accs.append(accuracy_score(y_val, y_val_pred))
-            else:
-                # Use training accuracy when no validation set
-                all_head_accs.append(accuracy_score(y_train, y_pred))
+            y_eval_pred = clf.predict(X_eval)
+            all_head_accs.append(accuracy_score(y_eval, y_eval_pred))
             probes.append(clf)
 
     all_head_accs_np = np.array(all_head_accs)
@@ -1196,9 +1554,8 @@ def get_interventions_dict(top_heads, probes, tuning_activations, num_heads, use
     for layer, head in top_heads:
         activations = tuning_activations[:,layer,head,:] # batch x 128
         if use_mat_direction or use_special_direction:
-            # print("batch activations shape", activations.shape) # batch x 128
             direction = com_directions[layer_head_to_flattened_idx(layer, head, num_heads)] # 128 x 128
-            # print("mat_direction shape", direction.shape) # 128 x 128
+
             proj_val_std = None
             # proj_vals = activations @ direction.T # batch x 128
             # proj_val_std = np.std(proj_vals, axis=0).reshape(1, -1) # 1 x 128
@@ -1215,11 +1572,148 @@ def get_interventions_dict(top_heads, probes, tuning_activations, num_heads, use
             proj_vals = activations @ direction.T
             proj_val_std = np.std(proj_vals)
             interventions[f"model.layers.{layer}.self_attn.o_proj"].append((head, direction.squeeze(), proj_val_std))
-
     for layer, head in top_heads: 
         interventions[f"model.layers.{layer}.self_attn.o_proj"] = sorted(interventions[f"model.layers.{layer}.self_attn.o_proj"], key = lambda x: x[0])
 
     return interventions
+
+def build_local_interventions_for_train_idx(
+                                    df: pd.DataFrame,  # dataframe with text, toxic_text, non_toxic_text, label
+                                    store: LocalStore,
+                                    interventions_global: dict,
+                                    row_i: int,
+                                    lam: float = None,
+                                    tau=20.0, K=None, use_contrastive=False,
+                                    v_global: dict = None, kappa=0.5, num_heads=32,
+                                    use_special_direction=False, use_mat_direction=False,
+                                    separated_head_wise_activations=None, separated_labels=None,
+                                    prompt_encodings=None,
+                                    timing_stats: "TimingStats" = None):
+    """
+    Returns a dict: { layer_name: [(head, direction_vector, proj_val_std), ...] }
+    direction_vector can be:
+        - 1-D np.float32 [d_head] for center of mass (default)
+        - 2-D np.float32 [d_head, prompt_dim] for special directions
+        - 2-D np.float32 [d_head, d_head] for mat directions
+    Built from local neighbors.
+    Optional interpolation with v_global[(L,H)] when mean similarity is low (works for all methods).
+    
+    Args:
+        use_special_direction: If True, compute special directions (requires separated_head_wise_activations, separated_labels)
+        use_mat_direction: If True, compute mat directions (requires separated_head_wise_activations, separated_labels)
+        separated_head_wise_activations: List of arrays for computing special/mat directions
+        separated_labels: List of label arrays for computing special/mat directions
+    """
+    local = {}
+    
+    # Use precomputed prompt encoding if available, otherwise encode on-the-fly
+    if use_special_direction:
+        if prompt_encodings is not None:
+            # Use precomputed encoding (much faster!)
+            prompt_encoding = prompt_encodings[row_i].reshape(1, -1)
+        else:
+            # Fallback: encode on-the-fly (slower)
+            print(f"Error encoding text for row {row_i}: no prompt encoding found")
+            return None
+    
+    for layer_name, head_list in interventions_global.items():
+        L = int(layer_name.split('.')[1]) if "gpt2" in layer_name else int(layer_name.split('.')[2])
+        if row_i > 752:
+            print(f"[DEBUG] Processing layer {L}, layer_name: {layer_name}, number of heads: {len(head_list)}", flush=True)
+        entries = []
+        for (head, _, proj_val_std) in head_list:
+            if row_i > 752:
+                print(f"[DEBUG] Processing row {row_i}, layer {L}, head {head}", flush=True)
+            try:
+                v_local, mean_sim = local_vec_from_train_idx(
+                    df, store, row_i, L, head, K=K, tau=tau, use_contrastive=use_contrastive,
+                    use_special_direction=use_special_direction, use_mat_direction=use_mat_direction,
+                    separated_head_wise_activations=separated_head_wise_activations,
+                    separated_labels=separated_labels,
+                    prompt_encoding=prompt_encoding,  # Pass pre-encoded prompt
+                    timing_stats=timing_stats,
+                )
+            except Exception as e:
+                print(f"Error in local_vec_from_train_idx for row {row_i}, layer {L}, head {head}: {e}")
+                import traceback
+                traceback.print_exc()
+                raise
+
+            if v_global is not None:
+                v_global_to_add = v_global[layer_head_to_flattened_idx(L, head, num_heads)]
+                if lam is not None:
+                    v = lam * v_local + (1 - lam) * v_global_to_add
+                else:
+                    mean_sim_clamped = np.clip(mean_sim, 0.0, 1.0)
+                    lam = kappa * (1.0 - mean_sim_clamped)
+                    lam = np.clip(lam, 0.0, 1.0)
+                    v = lam * v_local + (1 - lam) * v_global_to_add
+                
+            else:
+                v = v_local
+            entries.append((head, v, proj_val_std))
+
+        local[layer_name] = entries
+
+    return local
+
+def build_local_interventions_for_text(store: LocalStore,
+                                    interventions_global: dict,
+                                    k_query: np.ndarray,
+                                    tau=20.0, K=None, use_contrastive=False,
+                                    v_global: dict = None, kappa=0.5, num_heads=32,
+                                    use_special_direction=False, use_mat_direction=False,
+                                    separated_head_wise_activations=None, separated_labels=None,
+                                    prompt_encoding=None):
+    """
+    Returns a dict: { layer_name: [(head, direction_vector, proj_val_std), ...] }
+    direction_vector can be:
+        - 1-D np.float32 [d_head] for center of mass (default)
+        - 2-D np.float32 [d_head, prompt_dim] for special directions
+        - 2-D np.float32 [d_head, d_head] for mat directions
+    Built from local neighbors using k_query.
+    Optional interpolation with v_global[(L,H)] when mean similarity is low (works for all methods).
+    
+    Args:
+        use_special_direction: If True, compute special directions (requires separated_head_wise_activations, separated_labels, prompt_encoding)
+        use_mat_direction: If True, compute mat directions (requires separated_head_wise_activations, separated_labels)
+        separated_head_wise_activations: List of arrays for computing special/mat directions
+        separated_labels: List of label arrays for computing special/mat directions
+        prompt_encoding: np.array [prompt_dim] for special direction computation
+    """
+    local = {}
+    for layer_name, head_list in interventions_global.items():
+        L = int(layer_name.split('.')[1]) if "gpt2" in layer_name else int(layer_name.split('.')[2])
+        entries = []
+        for (head, _, proj_val_std) in head_list:
+            v_local, mean_sim = local_vec_from_query_key(
+                store, k_query, L, head, K=K, tau=tau, use_contrastive=use_contrastive,
+                use_special_direction=use_special_direction, use_mat_direction=use_mat_direction,
+                separated_head_wise_activations=separated_head_wise_activations,
+                separated_labels=separated_labels, prompt_encoding=prompt_encoding
+            )
+            # Interpolate with global for all methods (center of mass, special directions, mat directions)
+            if v_global is not None:
+                # lam controls interpolation: higher when local similarity is low (use more global)
+                # mean_sim is in [-1, 1] but typically [0, 1] for similar vectors
+                # Clamp mean_sim to [0, 1] to ensure lam is well-behaved
+                mean_sim_clamped = np.clip(mean_sim, 0.0, 1.0)
+                # When similarity is high (1.0), lam should be small (use local)
+                # When similarity is low (0.0), lam should be kappa (use global)
+                lam = kappa * (1.0 - mean_sim_clamped)
+                lam = np.clip(lam, 0.0, 1.0)  # Ensure lam stays in [0, 1]
+                v_global_to_add = v_global[layer_head_to_flattened_idx(L, head, num_heads)]
+                # Interpolate if shapes match (works for both 1D and 2D)
+                if v_local.shape == v_global_to_add.shape:
+                    v = lam * v_local + (1 - lam) * v_global_to_add
+                else:
+                    v = v_local
+            else:
+                v = v_local
+            entries.append((head, v, proj_val_std))
+        local[layer_name] = entries
+    return local
+
 
 def get_separated_activations(labels, head_wise_activations, categories, dataset): 
     if dataset == "toxigen":
@@ -1278,7 +1772,7 @@ def get_separated_activations(labels, head_wise_activations, categories, dataset
         grouped_activations.append(np.stack(group_acts))  # (5, L, H, D)
         grouped_labels.append(group_labels)
         idxs_to_split_at.append(len(grouped_activations) * 5)  # running total
-
+ 
 
     return grouped_activations, grouped_labels, idxs_to_split_at
 
@@ -1288,21 +1782,17 @@ def get_activations(labels, head_wise_activations, head_wise_c, dataset, model_n
         with open(hate_path) as f:
             data = [json.loads(line) for line in f]
         sentences = pd.DataFrame(data)
-    elif dataset == 'toxigen_vicuna':
-        toxigen_path = f'/work/hdd/bcxt/yian3/toxic/features/{dataset}_texts.json'
-        with open(toxigen_path) as f:
-            data = [json.loads(line) for line in f]
-        sentences = pd.DataFrame(data)
     elif dataset == 'paradetox':
         paradetox_path = f'/work/hdd/bcxt/yian3/toxic/features/{dataset}_texts.json'
         with open(paradetox_path, 'r') as f:
-            data = [json.loads(line) for line in f]
+            data = json.load(f)
         sentences = pd.DataFrame(data)
     else:
         sentences = pd.read_csv(f'./TruthfulQA/{dataset}.csv')
     texts = sentences["text"]
     toxic_texts = sentences["toxic_text"]
     non_toxic_texts = sentences["non_toxic_text"]
+    
     print("SHAPES", len(labels), len(head_wise_activations), len(texts), len(head_wise_c))
     
     grouped_activations = []
@@ -1312,6 +1802,7 @@ def get_activations(labels, head_wise_activations, head_wise_c, dataset, model_n
     used_idxs = set()
     
     for i in range(0, len(labels), 2):
+        # print("i", i)
         group_acts = [head_wise_activations[i], head_wise_activations[i+1]]
         group_labels = [labels[i], labels[i+1]]
         group_cs = [head_wise_c[i], head_wise_c[i+1]]
@@ -1329,49 +1820,77 @@ def get_activations(labels, head_wise_activations, head_wise_c, dataset, model_n
 
     return grouped_activations, grouped_labels, grouped_cs, idxs_to_split_at
 
-def get_com_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels): 
-    # Handle case where val_set_idxs is None or empty, and ensure arrays are 1D
-    train_set_idxs = np.atleast_1d(train_set_idxs)
-    if val_set_idxs is None or len(val_set_idxs) == 0:
-        usable_idxs = train_set_idxs
-    else:
-        # Ensure both arrays are 1D before concatenation
-        val_set_idxs = np.atleast_1d(val_set_idxs)
-        usable_idxs = np.concatenate([train_set_idxs, val_set_idxs], axis=0)
-
-    com_directions = []
-
-    for layer in range(num_layers): 
-        for head in range(num_heads): 
+def get_com_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, selected_heads=None): 
+    # Initialize with zeros - will only compute for selected heads if provided
+    if selected_heads is not None:
+        # Get the dimension from the first selected head
+        sample_idx = selected_heads[0]
+        sample_layer, sample_head = sample_idx
+        sample_dim = separated_head_wise_activations[train_set_idxs[0]][:, sample_layer, sample_head, :].shape[-1]
+        com_directions = np.zeros((num_layers * num_heads, sample_dim))
+        # Only compute for selected heads
+        # Convert to list if it's a numpy array
+        if isinstance(selected_heads, np.ndarray):
+            heads_to_compute = [tuple(h) for h in selected_heads]
+        else:
+            heads_to_compute = list(selected_heads)
+        for layer, head in heads_to_compute:
+            if val_set_idxs is None:
+                usable_idxs = train_set_idxs
+            else:
+                usable_idxs = np.concatenate([train_set_idxs, val_set_idxs], axis=0)
             usable_head_wise_activations = np.concatenate([separated_head_wise_activations[i][:,layer,head,:] for i in usable_idxs], axis=0)
             usable_labels = np.concatenate([separated_labels[i] for i in usable_idxs], axis=0)
             true_mass_mean = np.mean(usable_head_wise_activations[usable_labels == 1], axis=0)
             false_mass_mean = np.mean(usable_head_wise_activations[usable_labels == 0], axis=0)
-            com_directions.append(true_mass_mean - false_mass_mean)
-    com_directions = np.array(com_directions)
-
+            idx = layer_head_to_flattened_idx(layer, head, num_heads)
+            com_directions[idx] = true_mass_mean - false_mass_mean
+    else:
+        # Original behavior: compute for all heads
+        com_directions = []
+        for layer in range(num_layers): 
+            for head in range(num_heads): 
+                if val_set_idxs is None:
+                    usable_idxs = train_set_idxs
+                else:
+                    usable_idxs = np.concatenate([train_set_idxs, val_set_idxs], axis=0)
+                usable_head_wise_activations = np.concatenate([separated_head_wise_activations[i][:,layer,head,:] for i in usable_idxs], axis=0)
+                usable_labels = np.concatenate([separated_labels[i] for i in usable_idxs], axis=0)
+                true_mass_mean = np.mean(usable_head_wise_activations[usable_labels == 1], axis=0)
+                false_mass_mean = np.mean(usable_head_wise_activations[usable_labels == 0], axis=0)
+                com_directions.append(true_mass_mean - false_mass_mean)
+        com_directions = np.array(com_directions)
 
     return com_directions
 
-def get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, df): 
-    # Handle case where val_set_idxs is None or empty
-    if val_set_idxs is None or len(val_set_idxs) == 0:
-        print("Warning: val_set_idxs is None or empty. Using only training data.")
+def get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, df, selected_heads=None): 
+    if val_set_idxs is None:
         usable_idxs = train_set_idxs
     else:
         usable_idxs = np.concatenate([train_set_idxs, val_set_idxs], axis=0)
     usable_labels = [separated_labels[i] for i in usable_idxs]
-    all_prompt_encodings = [sentence_embedding.encode(df.loc[idx, 'text']) for idx in usable_idxs]
+    all_prompt_encodings = [sentence_embedding.encode(df.loc[idx, 'text'], show_progress_bar=False) for idx in usable_idxs]
     
-    sp_directions = []
-    for layer in tqdm(range(num_layers)): 
-        for head in range(num_heads):
+    if selected_heads is not None:
+        # Get the dimension from the first selected head
+        sample_idx = selected_heads[0]
+        sample_layer, sample_head = sample_idx
+        sample_dim = separated_head_wise_activations[train_set_idxs[0]][:, sample_layer, sample_head, :].shape[-1]
+        prompt_dim = all_prompt_encodings[0].shape[-1] if hasattr(all_prompt_encodings[0], 'shape') else len(all_prompt_encodings[0])
+        sp_directions = np.zeros((num_layers * num_heads, sample_dim, prompt_dim))
+        
+        # Only compute for selected heads
+        # Convert to list if it's a numpy array
+        if isinstance(selected_heads, np.ndarray):
+            heads_to_compute = [tuple(h) for h in selected_heads]
+        else:
+            heads_to_compute = list(selected_heads)
+        for layer, head in tqdm(heads_to_compute):
             direction = None
             for i in range(len(usable_idxs)):
                 idx = usable_idxs[i]
                 cur_usable_labels = np.array(usable_labels[i])
                 usable_head_wise_activations = separated_head_wise_activations[idx][:, layer, head, :]
-                
                 nontox_mass_mean = np.mean(usable_head_wise_activations[cur_usable_labels == 0], axis=0)
                 toxic_mass_mean = np.mean(usable_head_wise_activations[cur_usable_labels == 1], axis=0)
                 prompt_encoding = all_prompt_encodings[i]
@@ -1384,21 +1903,64 @@ def get_special_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, 
                     print("layer, head, i:", layer, head, i, cur_usable_labels)
                     break
             direction = direction / np.linalg.norm(direction, axis=1).reshape(-1, 1)
-            sp_directions.append(direction)
-    sp_directions = np.array(sp_directions)
+            idx = layer_head_to_flattened_idx(layer, head, num_heads)
+            sp_directions[idx] = direction
+    else:
+        # Original behavior: compute for all heads
+        sp_directions = []
+        for layer in tqdm(range(num_layers)): 
+            for head in range(num_heads):
+                direction = None
+                for i in range(len(usable_idxs)):
+                    idx = usable_idxs[i]
+                    cur_usable_labels = np.array(usable_labels[i])
+                    usable_head_wise_activations = separated_head_wise_activations[idx][:, layer, head, :]
+                    nontox_mass_mean = np.mean(usable_head_wise_activations[cur_usable_labels == 0], axis=0)
+                    toxic_mass_mean = np.mean(usable_head_wise_activations[cur_usable_labels == 1], axis=0)
+                    prompt_encoding = all_prompt_encodings[i]
+                    if direction is None: 
+                        direction = np.outer(nontox_mass_mean - toxic_mass_mean, prompt_encoding)
+                    else:
+                        direction += np.outer(nontox_mass_mean - toxic_mass_mean, prompt_encoding)
+                    delta = nontox_mass_mean - toxic_mass_mean
+                    if np.isnan(delta).any():
+                        print("layer, head, i:", layer, head, i, cur_usable_labels)
+                        break
+                direction = direction / np.linalg.norm(direction, axis=1).reshape(-1, 1)
+                # print("direction", direction.shape)
+                sp_directions.append(direction)
+        sp_directions = np.array(sp_directions)
+    
     print("DIRECTION SHAPE", sp_directions.shape)
     if np.isnan(sp_directions).any() or np.isinf(sp_directions).any():
-        print(f"[SKIP] NaN direction in layer {layer} head {head}")
-        direction = np.zeros_like(direction)
+        print(f"[SKIP] NaN direction detected")
+        # Find and fix NaN directions
+        nan_mask = np.isnan(sp_directions).any(axis=tuple(range(1, sp_directions.ndim)))
+        if nan_mask.any():
+            sp_directions[nan_mask] = 0
     return sp_directions
 
-def get_matrix_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels): 
-    usable_idxs = np.concatenate([train_set_idxs, val_set_idxs], axis=0)
+def get_matrix_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, selected_heads=None): 
+    if val_set_idxs is None:
+        usable_idxs = train_set_idxs
+    else:
+        usable_idxs = np.concatenate([train_set_idxs, val_set_idxs], axis=0)
     usable_labels = [separated_labels[i] for i in usable_idxs]
 
-    mat_directions = []
-    for layer in tqdm(range(num_layers)): 
-        for head in range(num_heads):
+    if selected_heads is not None:
+        # Get the dimension from the first selected head
+        sample_idx = selected_heads[0]
+        sample_layer, sample_head = sample_idx
+        sample_dim = separated_head_wise_activations[train_set_idxs[0]][:, sample_layer, sample_head, :].shape[-1]
+        mat_directions = np.zeros((num_layers * num_heads, sample_dim, sample_dim))
+        
+        # Only compute for selected heads
+        # Convert to list if it's a numpy array
+        if isinstance(selected_heads, np.ndarray):
+            heads_to_compute = [tuple(h) for h in selected_heads]
+        else:
+            heads_to_compute = list(selected_heads)
+        for layer, head in tqdm(heads_to_compute):
             direction = None
             for i in range(len(usable_idxs)):
                 idx = usable_idxs[i]
@@ -1412,6 +1974,26 @@ def get_matrix_directions(num_layers, num_heads, train_set_idxs, val_set_idxs, s
                 else:
                     direction += np.outer(true_mass_mean - false_mass_mean, false_mass_mean)
             direction = direction / (np.linalg.norm(direction, axis=1).reshape(-1, 1) + 1e-6)
-            mat_directions.append(direction)
-    mat_directions = np.array(mat_directions)
+            idx = layer_head_to_flattened_idx(layer, head, num_heads)
+            mat_directions[idx] = direction
+    else:
+        # Original behavior: compute for all heads
+        mat_directions = []
+        for layer in tqdm(range(num_layers)): 
+            for head in range(num_heads):
+                direction = None
+                for i in range(len(usable_idxs)):
+                    idx = usable_idxs[i]
+                    cur_usable_labels = np.array(usable_labels[i])
+                    usable_head_wise_activations = separated_head_wise_activations[idx][:, layer, head, :]
+                    true_mass_mean = np.mean(usable_head_wise_activations[cur_usable_labels == 0], axis=0)
+                    false_mass_mean = np.mean(usable_head_wise_activations[cur_usable_labels == 1], axis=0)
+                    # print("overflow check", np.max(np.abs(np.outer(true_mass_mean - false_mass_mean, false_mass_mean))))
+                    if direction is None: 
+                        direction = np.outer(true_mass_mean - false_mass_mean, false_mass_mean)
+                    else:
+                        direction += np.outer(true_mass_mean - false_mass_mean, false_mass_mean)
+                direction = direction / (np.linalg.norm(direction, axis=1).reshape(-1, 1) + 1e-6)
+                mat_directions.append(direction)
+        mat_directions = np.array(mat_directions)
     return mat_directions

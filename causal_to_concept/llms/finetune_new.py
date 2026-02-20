@@ -758,11 +758,11 @@ def main():
     # --- CONFIG ---
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # Load selected heads
-    args.heads_path = f"/work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_alpha_{args.alpha}_fold_0_top_heads.npy"
+    args.heads_path = f"/work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_fold_0.npy"
     if os.path.exists(args.heads_path):
         selected_heads = np.load(args.heads_path)
     else:
-        args.heads_path = f"/work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_72_heads_alpha_{args.alpha}_fold_0_top_heads.npy"
+        args.heads_path = f"/work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_72_heads_fold_0.npy"
         selected_heads = np.load(args.heads_path)
     selected_heads = selected_heads[:args.num_heads] if len(selected_heads) > args.num_heads else selected_heads
     model_name = HF_NAMES[args.model_name]

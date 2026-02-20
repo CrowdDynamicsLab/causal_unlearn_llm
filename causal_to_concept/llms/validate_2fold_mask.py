@@ -76,6 +76,12 @@ def main():
     parser.add_argument('--dataset_name', type=str, default='toxigen_vicuna', help='feature bank for training probes')
     parser.add_argument('--activations_dataset', type=str, default='toxigen_vicuna', help='feature bank for calculating std along direction')
     parser.add_argument('--num_heads', type=int, default=48, help='K, number of top heads to intervene on')
+    parser.add_argument(
+        '--mask',
+        type=int,
+        default=0,
+        help='Number of top-ranked selected heads to ablate by zeroing their outputs (e.g., if 36 heads and mask=6, zero the top-6 and intervene on the remaining 30).',
+    )
     parser.add_argument('--heads_path', type=str, 
                       default="/work/hdd/bcxt/yian3/toxic/features/heads/False_vicuna_13B_toxigen_vicuna_seed_2_top_36_heads_fold_0.npy",
                       help='Path to selected heads numpy file')
@@ -331,8 +337,34 @@ def main():
             else:
                 top_heads, probes = get_top_heads(train_set_idxs, val_set_idxs, separated_head_wise_activations, separated_labels, num_layers, num_heads, args.seed, args.num_heads, args.use_random_dir)
         np.save(f'/work/hdd/bcxt/yian3/toxic/features/heads/{args.use_pns}_{args.model_name}_{args.dataset_name}_seed_{args.seed}_top_{args.num_heads}_heads_fold_{i}.npy', top_heads)
-        print("Heads intervened: ", top_heads)
-        interventions = get_interventions_dict(top_heads, probes, tuning_activations, num_heads, args.use_center_of_mass, args.use_random_dir, args.use_mat_direction, args.use_special_direction, com_directions)
+
+        # Mask semantics: "delete" (ablate) the first `mask` heads by zeroing their head outputs.
+        # The remaining heads still receive the normal intervention.
+        if args.mask < 0:
+            raise ValueError(f"--mask must be >= 0, got {args.mask}")
+        ablated_heads = top_heads[: args.mask] if args.mask > 0 else []
+        intervened_heads = top_heads[args.mask :] if args.mask > 0 else top_heads
+
+        # Build a per-layer lookup for ablation inside the intervention function.
+        ablated_heads_by_layer = {}
+        for layer, head in ablated_heads:
+            layer_i = int(layer)
+            head_i = int(head)
+            ablated_heads_by_layer.setdefault(layer_i, set()).add(head_i)
+        ablated_heads_by_layer = {k: sorted(v) for k, v in ablated_heads_by_layer.items()}
+
+        print(f"Selected top heads: {len(top_heads)} | Ablated (mask): {len(ablated_heads)} | Intervened: {len(intervened_heads)}")
+        if args.mask > 0:
+            print("Ablated heads (zeroed): ", ablated_heads)
+        print("Heads intervened: ", intervened_heads)
+
+        interventions = get_interventions_dict(intervened_heads, probes, tuning_activations, num_heads, args.use_center_of_mass, args.use_random_dir, args.use_mat_direction, args.use_special_direction, com_directions)
+
+        # Ensure we still register hooks for layers that only have ablated heads (even if no direction add).
+        # alt_tqa_evaluate only attaches hooks to modules present in `interventions`.
+        for layer, _head in ablated_heads:
+            layer_name = f"model.layers.{int(layer)}.self_attn.o_proj"
+            interventions.setdefault(layer_name, [])
         print("Finished computing interventions dict")
 
         def lt_modulated_vector_add(_head_output, layer_name, start_edit_location='lt', prompt_encoding=None):
@@ -346,6 +378,14 @@ def main():
             if prompt_encoding is not None: # use_special_direction
                 assert prompt_encoding.shape == (384,)
                 prompt_encoding = torch.FloatTensor(prompt_encoding).to(head_output.device.index).reshape(-1, 384)
+
+            # Zero-out (ablate) masked heads for this layer.
+            if args.mask > 0 and layer in ablated_heads_by_layer:
+                for ablated_head in ablated_heads_by_layer[layer]:
+                    if start_edit_location == 'lt':
+                        head_output[:, -1, ablated_head, :] = 0
+                    else:
+                        head_output[:, start_edit_location:, ablated_head, :] = 0
             
             for head, direction, proj_val_std in interventions[layer_name]:
                 if len(direction.shape) == 2: # use_mat_direction or use_special_direction
@@ -395,6 +435,8 @@ def main():
 
         # Create a cleaner filename for the output path
         output_filename = f'{args.model_name}_{head_selection}_top{args.num_heads}_alpha{args.alpha}_fold{i}'
+        if args.mask > 0:
+            output_filename += f'_mask{args.mask}'
         
         if args.use_center_of_mass:
             output_filename += '_com'
@@ -414,12 +456,12 @@ def main():
             summary_path = f'results_dump/summary_dump/{args.dataset_name}/{orig_model}/{output_filename}.csv'
         elif args.dataset_name == 'toxigen':
             input_path = f'splits/{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv'
-            output_path = f'results_dump/answer_dump/{args.dataset_name}/{orig_model}/{prefix}_answer_no_inst_{output_filename}.csv'
-            summary_path = f'results_dump/summary_dump/{args.dataset_name}/{orig_model}/{output_filename}.csv'
+            output_path = f'results_dump/answer_dump/{args.dataset_name}/{orig_model}/{args.mask}_{prefix}_answer_no_inst_{output_filename}.csv'
+            summary_path = f'results_dump/summary_dump/{args.dataset_name}/{orig_model}/{args.mask}_{output_filename}.csv'
         elif args.dataset_name == 'toxigen_vicuna' or args.dataset_name == 'hate_vicuna':
             input_path = f'splits/{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv'
-            output_path = f'results_dump/answer_dump/{args.dataset_name}/{orig_model}/{prefix}_answer_no_inst_{output_filename}.csv'
-            summary_path = f'results_dump/summary_dump/{args.dataset_name}/{orig_model}/{prefix}_summary_no_inst_{output_filename}.csv'
+            output_path = f'results_dump/answer_dump/{args.dataset_name}/{orig_model}/{args.mask}_{prefix}_answer_no_inst_{output_filename}.csv'
+            summary_path = f'results_dump/summary_dump/{args.dataset_name}/{orig_model}/{args.mask}_{prefix}_summary_no_inst_{output_filename}.csv'
         elif args.dataset_name == 'paradetox':
             input_path = f'splits/{args.dataset_name}_fold_{i}_test_seed_{args.seed}.csv'
             output_path = f'results_dump/answer_dump/{args.dataset_name}/{orig_model}/{prefix}_answer_no_inst_{output_filename}.csv'

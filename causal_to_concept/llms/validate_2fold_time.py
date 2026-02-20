@@ -22,9 +22,10 @@ from vae import VAE, vae_loss_function, train_vae, test_vae
 
 import sys
 sys.path.append('../')
-from utils_context import alt_tqa_evaluate, flattened_idx_to_layer_head, layer_head_to_flattened_idx, get_interventions_dict, get_top_heads, get_separated_activations, get_com_directions, get_activations
-from utils_context import get_special_directions, get_matrix_directions, train_vae_and_extract_mu, get_top_heads_pns, LocalStore, build_local_interventions_for_train_idx
-from utils_context import TimingStats
+from utils_time import alt_tqa_evaluate, flattened_idx_to_layer_head, layer_head_to_flattened_idx, get_interventions_dict, get_top_heads, get_separated_activations, get_com_directions, get_activations
+from utils_time import get_special_directions, get_matrix_directions, train_vae_and_extract_mu, get_top_heads_pns, LocalStore, build_local_interventions_for_train_idx
+from utils_time import TimingStats, tqa_run_answers
+from TruthfulQA.truthfulqa import utilities
 # import llama
 
 HF_NAMES = {
@@ -176,6 +177,7 @@ def main():
     parser.add_argument('--timing', action='store_true', default=False, help='Enable timing instrumentation for local retrieval + generation')
     parser.add_argument('--timing_n_prompts', type=int, default=50, help='Number of prompts to average timing over (used if --max_examples not set)')
     parser.add_argument('--timing_no_baseline', action='store_true', default=False, help='Disable baseline generation timing (by default baseline is measured; disabling avoids the extra generation pass)')
+    parser.add_argument('--timing_compare_3ways', action='store_true', default=False, help='Compute per-prompt generation time for baseline vs global vs local (timing-only, skips metrics)')
     args = parser.parse_args()
     
     # Setup logging
@@ -401,6 +403,8 @@ def main():
                 raise FileNotFoundError(f"Precomputed prompt encodings not found. Run build_prompt_encodings.py first.")
         
         logger.info("Initializing LazyLocalInterventions (No pre-computation)")
+        # In 3-way compare mode, we want local generation + local kNN retrieval stats in one object.
+        local_timing_stats = TimingStats() if (args.timing and args.timing_compare_3ways) else timing_stats
         # Create a partial function with all fixed arguments
         builder_partial = partial(
             build_local_interventions_for_train_idx,
@@ -419,7 +423,7 @@ def main():
             use_special_direction=args.use_special_direction, 
             use_mat_direction=args.use_mat_direction,
             prompt_encodings=all_prompt_encodings,
-            timing_stats=timing_stats
+            timing_stats=local_timing_stats
         )
         local_interventions = LazyLocalInterventions(test_idxs, builder_partial)
         logger.info("Finished initializing LazyLocalInterventions")
@@ -496,6 +500,67 @@ def main():
             
             return lc_modulated_vector_add
 
+        def create_global_intervention_fn(_sample_idx):
+            """Factory wrapper to make global interventions compatible with utils_time.tqa_run_answers()."""
+            def lt_modulated_vector_add(_head_output, layer_name, start_edit_location='lt', prompt_encoding=None):
+                head_output = _head_output.detach().type(torch.float32)
+                head_output = rearrange(head_output, 'b s (h d) -> b s h d', h=num_heads)
+                if "gpt2" in args.model_name:
+                    layer = int(layer_name.split('.')[1])  # e.g., 'transform.h.3'
+                else:
+                    layer = int(layer_name.split('.')[2])
+
+                if prompt_encoding is not None:  # use_special_direction
+                    assert prompt_encoding.shape == (384,)
+                    prompt_encoding = torch.FloatTensor(prompt_encoding).to(head_output.device.index).reshape(-1, 384)
+
+                for head, direction, proj_val_std in interventions[layer_name]:
+                    if len(direction.shape) == 2:
+                        activations = torch.FloatTensor(tuning_activations[:, layer, head, :]).to(head_output.device.index)
+                        direction = torch.FloatTensor(direction).to(head_output.device.index)  # 128 x 384
+                        if start_edit_location == 'lt':
+                            if prompt_encoding is None:
+                                direction_to_add = head_output[0, -1, head, :] @ direction.T  # [128]
+                                direction_to_add = direction_to_add / torch.linalg.norm(direction_to_add)
+                            else:
+                                direction_to_add = prompt_encoding @ direction.T  # 1 x 128
+                                direction_to_add = direction_to_add / torch.linalg.norm(direction_to_add, axis=1, keepdim=True)
+
+                            if len(direction_to_add.shape) == 1:
+                                direction_to_add = direction_to_add.unsqueeze(0)
+                            proj_vals = activations @ direction_to_add.T
+                            proj_val_std = torch.std(proj_vals, axis=0).reshape(1, -1)
+                        else:
+                            if prompt_encoding is None:
+                                direction_to_add = torch.einsum('bij,jk->bik', head_output[0, start_edit_location:, head, :], direction.T)
+                                direction_to_add = direction_to_add / torch.linalg.norm(direction_to_add, axis=2)[:, :, None]
+                            else:
+                                direction_to_add = prompt_encoding @ direction.T
+                                direction_to_add = direction_to_add.unsqueeze(1).repeat(1, head_output.shape[1] - start_edit_location, 1)
+                                direction_to_add = direction_to_add / torch.linalg.norm(direction_to_add, axis=1).reshape(-1, 1)
+
+                            proj_vals = torch.einsum('Bk,bik->Bbi', activations, direction_to_add)
+                            proj_val_std = torch.std(proj_vals, axis=0)[:, :, None]
+
+                        proj_val_std = torch.Tensor(proj_val_std).to(head_output.device.index)
+                        if start_edit_location == 'lt':
+                            head_output[:, -1, head, :] += args.alpha * proj_val_std * direction_to_add
+                        else:
+                            head_output[:, start_edit_location:, head, :] += args.alpha * proj_val_std * direction_to_add
+
+                    else:
+                        direction_to_add = torch.FloatTensor(direction).to(head_output.device.index)
+                        proj_val_std = torch.Tensor(proj_val_std).to(head_output.device.index)
+                        if start_edit_location == 'lt':
+                            head_output[:, -1, head, :] += args.alpha * proj_val_std * direction_to_add
+                        else:
+                            head_output[:, start_edit_location:, head, :] += args.alpha * proj_val_std * direction_to_add
+
+                head_output = rearrange(head_output, 'b s h d -> b s (h d)')
+                return head_output.type(torch.float16)
+
+            return lt_modulated_vector_add
+
         # Create a cleaner filename for the output path
         output_filename = f'{args.model_name}_{head_selection}_top{args.num_heads}_alpha{args.alpha}_lam{args.lam}_fold{i}'
         
@@ -534,6 +599,86 @@ def main():
         if args.timing and args.max_examples is None:
             args.max_examples = args.timing_n_prompts
             logger.info(f"[timing] Setting --max_examples to {args.max_examples} for timing averages")
+
+        if args.timing and args.timing_compare_3ways:
+            # Timing-only: per-prompt generation times for baseline vs global vs local
+            questions = utilities.load_questions(filename=input_path)
+            if args.max_examples and len(questions) > args.max_examples:
+                questions = questions.head(args.max_examples)
+
+            ts_base = TimingStats()
+            _ = tqa_run_answers(
+                questions.copy(),
+                MODEL,
+                "baseline",
+                preset='toxic',
+                model=model,
+                tokenizer=tokenizer,
+                device="cuda",
+                verbose=False,
+                interventions={},
+                local_interventions={},
+                intervention_fn=None,
+                instruction_prompt=True,
+                use_special_direction=args.use_special_direction,
+                task=args.task,
+                timing_stats=ts_base,
+                timing_baseline=True,
+                timing_mode="baseline_only",
+            )
+
+            ts_global = TimingStats()
+            _ = tqa_run_answers(
+                questions.copy(),
+                MODEL,
+                "global",
+                preset='toxic',
+                model=model,
+                tokenizer=tokenizer,
+                device="cuda",
+                verbose=False,
+                interventions=interventions,
+                local_interventions={},
+                intervention_fn=create_global_intervention_fn,
+                instruction_prompt=True,
+                use_special_direction=args.use_special_direction,
+                task=args.task,
+                timing_stats=ts_global,
+                timing_baseline=False,
+                timing_mode="steered_only",
+            )
+
+            # Reuse local_timing_stats so it also captures kNN retrieval timing from the builder
+            _ = tqa_run_answers(
+                questions.copy(),
+                MODEL,
+                "local",
+                preset='toxic',
+                model=model,
+                tokenizer=tokenizer,
+                device="cuda",
+                verbose=False,
+                interventions=interventions,
+                local_interventions=local_interventions,
+                intervention_fn=create_intervention_fn,
+                instruction_prompt=True,
+                use_special_direction=args.use_special_direction,
+                task=args.task,
+                timing_stats=local_timing_stats,
+                timing_baseline=False,
+                timing_mode="steered_only",
+            )
+
+            base_avg = ts_base.avg_baseline_gen_sec()
+            global_avg = ts_global.avg_steered_gen_sec()
+            local_avg = local_timing_stats.avg_steered_gen_sec()
+            print("=== Per-prompt generation time (averaged) ===")
+            print(f"- baseline (no intervention): {base_avg:.6f}s  (prompts={ts_base.baseline_gen_prompts})")
+            print(f"- global intervention:        {global_avg:.6f}s  (prompts={ts_global.steered_gen_prompts})  overhead vs base: {global_avg - base_avg:.6f}s")
+            print(f"- local intervention:         {local_avg:.6f}s  (prompts={local_timing_stats.steered_gen_prompts})  overhead vs base: {local_avg - base_avg:.6f}s")
+            print("=== Local retrieval (kNN only) ===")
+            print(f"- kNN retrieval (only): {local_timing_stats.avg_knn_sec():.6f}s  (calls={local_timing_stats.retrieval_knn_calls})")
+            return
         curr_fold_results = alt_tqa_evaluate(
             {args.model_name: model}, 
             ['toxic', 'sense'], #, 'mc'

@@ -29,6 +29,7 @@ from pprint import pprint
 from TruthfulQA.truthfulqa import utilities, models, metrics
 import openai
 from time import sleep
+import time
 from TruthfulQA.truthfulqa.configs import BEST_COL, ANSWER_COL, INCORRECT_COL
 
 from TruthfulQA.truthfulqa.utilities import (
@@ -48,6 +49,66 @@ sentence_embedding = SentenceTransformer('all-MiniLM-L6-v2')
 
 # local_store.py
 import os, numpy as np, torch
+
+
+def _maybe_cuda_sync(device=None):
+    """
+    Best-effort CUDA sync helper for accurate wall-clock timing.
+    Safe to call in CPU-only environments.
+    """
+    try:
+        if torch.cuda.is_available():
+            # If device is specified, only sync for cuda-like devices.
+            if device is None:
+                torch.cuda.synchronize()
+            else:
+                dev_str = str(device)
+                if "cuda" in dev_str:
+                    torch.cuda.synchronize()
+    except Exception:
+        # Never let timing utilities crash the main pipeline
+        return
+
+
+class TimingStats:
+    """
+    Aggregates timing measurements (seconds) across many prompts.
+    - retrieval_knn_sec: time spent doing kNN lookup only (neighbors + sims fetch or brute-force search)
+    - baseline_gen_sec: generation time with NO interventions
+    - steered_gen_sec: generation time with interventions enabled
+    """
+    def __init__(self):
+        self.retrieval_knn_sec = 0.0
+        self.retrieval_knn_calls = 0
+        self.baseline_gen_sec = 0.0
+        self.baseline_gen_prompts = 0
+        self.steered_gen_sec = 0.0
+        self.steered_gen_prompts = 0
+
+    def add_knn(self, dt_sec: float):
+        self.retrieval_knn_sec += float(dt_sec)
+        self.retrieval_knn_calls += 1
+
+    def add_baseline_gen(self, dt_sec: float):
+        self.baseline_gen_sec += float(dt_sec)
+        self.baseline_gen_prompts += 1
+
+    def add_steered_gen(self, dt_sec: float):
+        self.steered_gen_sec += float(dt_sec)
+        self.steered_gen_prompts += 1
+
+    def summary_str(self) -> str:
+        base_avg = self.baseline_gen_sec / max(self.baseline_gen_prompts, 1)
+        steer_avg = self.steered_gen_sec / max(self.steered_gen_prompts, 1)
+        knn_avg = self.retrieval_knn_sec / max(self.retrieval_knn_calls, 1)
+        overhead_avg = steer_avg - base_avg if self.baseline_gen_prompts > 0 else float("nan")
+        return (
+            "=== Timing breakdown (averages) ===\n"
+            f"- kNN retrieval (only): {knn_avg:.6f}s  (calls={self.retrieval_knn_calls})\n"
+            f"- Baseline generation (no intervention): {base_avg:.6f}s  (prompts={self.baseline_gen_prompts})\n"
+            f"- Total generation (with intervention): {steer_avg:.6f}s  (prompts={self.steered_gen_prompts})\n"
+            f"- Intervention overhead (delta): {overhead_avg:.6f}s\n"
+        )
 ENGINE_MAP = {
     'llama_1B': 'meta-llama/Llama-3.2-1B', 
     'llama_3B': 'meta-llama/Llama-3.2-3B',
@@ -149,8 +210,49 @@ class LocalStore:
                 else:
                     print(f"Warning: No diff data found for layer {L}, head {H}")
         self.K_default = K_default
+        # Cache the most recent kNN result to avoid repeating kNN work across heads for the same row.
+        # Shape: (row_i, K, idx[int32,K], sF[float32,K])
+        self._knn_cache = None
 
     def n_items(self): return self.keys.shape[0]
+
+    def get_knn_for_train_row(self, row_i: int, K: int = None, timing_stats: "TimingStats" = None):
+        """
+        Return (idx, sF) for train row row_i:
+          - idx: int32 [K]
+          - sF : float32 [K] similarities to neighbors (non-toxic key space)
+        Times ONLY the kNN retrieval block (precomputed lookup or brute-force search).
+        """
+        K = int(K or self.K_default)
+
+        # Cache hit
+        if self._knn_cache is not None:
+            cached_row_i, cached_K, cached_idx, cached_sF = self._knn_cache
+            if cached_row_i == row_i and cached_K == K:
+                return cached_idx, cached_sF
+
+        _maybe_cuda_sync(self.device)
+        t0 = time.perf_counter()
+
+        if self.neighbors is not None and self.sims is not None and self.K_saved is not None and self.K_saved >= K:
+            idx = self.neighbors[row_i, :K].astype("int32")          # [K]
+            sF = self.sims[row_i, :K].astype("float32")              # [K]
+        else:
+            # On-the-fly brute force (exact cosine)
+            keys = self.keys
+            sims_all = keys @ keys[row_i]                            # [N]
+            sims_all[row_i] = -1e9                                   # exclude self
+            idx = np.argpartition(sims_all, -K)[-K:]
+            idx = idx[np.argsort(sims_all[idx])[::-1]].astype("int32")
+            sF = sims_all[idx].astype("float32")
+
+        _maybe_cuda_sync(self.device)
+        t1 = time.perf_counter()
+        if timing_stats is not None:
+            timing_stats.add_knn(t1 - t0)
+
+        self._knn_cache = (row_i, K, idx, sF)
+        return idx, sF
 
 def weights_softmax(s, tau=20.0):
     s = torch.as_tensor(s, dtype=torch.float32)
@@ -167,7 +269,8 @@ def weights_contrastive(sF, sT, tau=20.0):
 def local_vec_from_train_idx(df: pd.DataFrame, store: LocalStore, i, L, H, K=None, tau=20.0, use_contrastive=False,
                               use_special_direction=False, use_mat_direction=False,
                               separated_head_wise_activations=None, separated_labels=None,
-                              prompt_encoding=None):
+                              prompt_encoding=None,
+                              timing_stats: "TimingStats" = None):
     """
     Returns v_local for (L,H) using row i's KNN among training.
     
@@ -184,20 +287,12 @@ def local_vec_from_train_idx(df: pd.DataFrame, store: LocalStore, i, L, H, K=Non
         separated_labels: List of label arrays for computing special/mat directions
         prompt_encoding: np.array [prompt_dim] for special direction computation
     """
-    keys, keys_tox, diffs = store.keys, store.keys_tox, store.diffs[(L, H)]
+    keys_tox, diffs = store.keys_tox, store.diffs[(L, H)]
     K = K or store.K_default
-    if store.neighbors is not None and store.sims is not None and store.K_saved >= K:
-        idx = store.neighbors[i, :K]                     # [K]
-        sF  = store.sims[i, :K].astype("float32")        # [K]
-    else:
-        # On-the-fly brute force (exact cosine)
-        sims_all = keys @ keys[i]                        # [N]
-        sims_all[i] = -1e9                               # exclude self
-        idx = np.argpartition(sims_all, -K)[-K:]
-        idx = idx[np.argsort(sims_all[idx])[::-1]]
-        sF = sims_all[idx].astype("float32")
+    idx, sF = store.get_knn_for_train_row(i, K=K, timing_stats=timing_stats)
     if use_contrastive and (keys_tox is not None):
-        sT = (keys_tox[idx] @ keys[i]).astype("float32")
+        # NOTE: contrastive uses toxic keys against the same query key (non-toxic space)
+        sT = (keys_tox[idx] @ store.keys[i]).astype("float32")
         w = weights_contrastive(sF, sT, tau)
     else:
         w = weights_softmax(sF, tau)
@@ -230,7 +325,7 @@ def local_vec_from_train_idx(df: pd.DataFrame, store: LocalStore, i, L, H, K=Non
             if not has_nontox or not has_tox:
                 # Skip this neighbor if it doesn't have both labels
                 raise ValueError(f"Neighbor {neighbor_idx} does not have both labels")
-                import pdb; pdb.set_trace()
+                # NOTE: no debugger trap here; keep pipeline non-interactive
             
             nontox_mean = np.mean(neighbor_activations[neighbor_labels == 0], axis=0)
             tox_mean = np.mean(neighbor_activations[neighbor_labels == 1], axis=0)
@@ -572,16 +667,20 @@ def train_vae_and_extract_mu(head_wise_activations, labels, input_dim, z_dim=1, 
     # y_train = torch.tensor(label_train_raw, dtype=torch.float32)
     # y_val = torch.tensor(label_val_raw, dtype=torch.float32)
     print("LENGTH OF HEADWISE ACTIVATIONS", len(head_wise_activations))
+    
+    
     split = int(0.8 * len(head_wise_activations))
     train_raw = head_wise_activations[:split]
     val_raw = head_wise_activations[split:]
+    
+    print(f"Converting to tensors: train shape {train_raw.shape}, val shape {val_raw.shape}, input_dim {input_dim}")
     all_X_train = torch.tensor(np.array(train_raw), dtype=torch.float32).view(-1, input_dim)
     all_X_val   = torch.tensor(np.array(val_raw), dtype=torch.float32).view(-1, input_dim)
     label_train_raw = labels[:split]
     label_val_raw = labels[split:]
     y_train = torch.tensor(label_train_raw, dtype=torch.float32)
     y_val = torch.tensor(label_val_raw, dtype=torch.float32)
-    print("done reading data")
+    print(f"done reading data - train tensor size: {all_X_train.shape}, memory: {all_X_train.element_size() * all_X_train.nelement() / (1024**3):.2f} GB")
     # Dataloaders
     train_loader = DataLoader(TensorDataset(all_X_train), batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(TensorDataset(all_X_val), batch_size=batch_size, shuffle=False)
@@ -653,7 +752,10 @@ def intervention_fn(head_output, layer_name, start_edit_location='lt', prompt_en
     return head_output
 
 
-def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verbose=True, device=None, cache_dir=None, interventions={}, local_interventions={}, intervention_fn=None, instruction_prompt=True, many_shot_prefix=None, use_special_direction=False, task='continuation'):
+def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verbose=True, device=None, cache_dir=None,
+                    interventions={}, local_interventions={}, intervention_fn=None,
+                    instruction_prompt=True, many_shot_prefix=None, use_special_direction=False, task='continuation',
+                    timing_stats: "TimingStats" = None, timing_baseline: bool = True):
 
     """
     Args:
@@ -724,6 +826,26 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
     with torch.no_grad():
         for idx, input_ids in enumerate(tqdm(tokens)):
             max_len = input_ids.shape[-1] + 50
+            gen_kwargs = dict(
+                top_k=10,
+                max_length=max_len,
+                num_return_sequences=1,
+                min_new_tokens=20,
+                do_sample=True,
+                temperature=0.7,
+            )
+
+            # -------------------------
+            # Baseline generation timing (no intervention)
+            # -------------------------
+            if timing_stats is not None and timing_baseline:
+                input_ids_dev = input_ids.to(device)
+                _maybe_cuda_sync(device)
+                t0 = time.perf_counter()
+                _ = model.generate(input_ids_dev, **gen_kwargs)  # includes prompt
+                _maybe_cuda_sync(device)
+                t1 = time.perf_counter()
+                timing_stats.add_baseline_gen(t1 - t0)
 
             # --- intervention code --- #
             # Create intervention function for this specific sample
@@ -734,11 +856,34 @@ def tqa_run_answers(frame, engine, tag, preset, model=None, tokenizer=None, verb
                 sample_idx = sample_indices[idx] if idx < len(sample_indices) else 0
                 raw_hook = intervention_fn(sample_idx)
                 intervene = partial(raw_hook, start_edit_location='lt', prompt_encoding=prompt_encoding)
+
+            # -------------------------
+            # Retrieval prefetch (separate from generation timing)
+            # -------------------------
+            # Ensure local interventions for this sample are computed BEFORE timing steered generation,
+            # so retrieval does not contaminate generation-time measurements.
+            if local_interventions and active != {}:
+                try:
+                    _ = local_interventions[sample_idx]
+                except Exception:
+                    # Do not crash generation if prefetch fails; downstream will error if truly required
+                    pass
             
-            with TraceDict(model, layers_to_intervene, edit_output=intervene) as ret: 
-                input_ids = input_ids.to(device)
-                model_gen_tokens = model.generate(input_ids, top_k=10, max_length=max_len, num_return_sequences=1,
-                                                    min_new_tokens=20, do_sample=True, temperature=0.7)[:, input_ids.shape[-1]:]
+            # -------------------------
+            # Steered generation timing (intervention enabled)
+            # -------------------------
+            input_ids = input_ids.to(device)
+            if timing_stats is not None:
+                _maybe_cuda_sync(device)
+                t0 = time.perf_counter()
+                with TraceDict(model, layers_to_intervene, edit_output=intervene) as ret:
+                    model_gen_tokens = model.generate(input_ids, **gen_kwargs)[:, input_ids.shape[-1]:]
+                _maybe_cuda_sync(device)
+                t1 = time.perf_counter()
+                timing_stats.add_steered_gen(t1 - t0)
+            else:
+                with TraceDict(model, layers_to_intervene, edit_output=intervene) as ret:
+                    model_gen_tokens = model.generate(input_ids, **gen_kwargs)[:, input_ids.shape[-1]:]
             model_gen_str = tokenizer.decode(model_gen_tokens[0], skip_special_tokens=True)
             model_gen_str = model_gen_str.strip()
 
@@ -1036,7 +1181,12 @@ def run_kl_wrt_orig(model_key, model=None, tokenizer=None, device='cuda', interv
 
     return np.mean(kl_divs)
 
-def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path, device='cpu', verbose=False, preset='toxic', interventions={}, local_interventions={}, intervention_fn=None, cache_dir=None, separate_kl_device=None, instruction_prompt=True, many_shot_prefix=None, judge_name=None, info_name=None, use_special_direction=False, local_builder=None, context_k=64, max_examples=None, task='continuation'):
+def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path, device='cpu', verbose=False, preset='toxic',
+                     interventions={}, local_interventions={}, intervention_fn=None,
+                     cache_dir=None, separate_kl_device=None, instruction_prompt=True, many_shot_prefix=None,
+                     judge_name=None, info_name=None, use_special_direction=False, local_builder=None, context_k=64,
+                     max_examples=None, task='continuation',
+                     timing_stats: "TimingStats" = None, timing_baseline: bool = True):
     """
     Inputs:
     models: a dictionary of the form {model_name: model} where model is a HF transformer # TODO: doesn't work with models other than llama right now
@@ -1097,7 +1247,8 @@ def alt_tqa_evaluate(models, metric_names, input_path, output_path, summary_path
                         device=device, cache_dir=cache_dir, verbose=verbose,
                         interventions=interventions, local_interventions=local_interventions, intervention_fn=intervention_fn, 
                         instruction_prompt=instruction_prompt, many_shot_prefix=many_shot_prefix, 
-                        use_special_direction=use_special_direction, task=task)
+                        use_special_direction=use_special_direction, task=task,
+                        timing_stats=timing_stats, timing_baseline=timing_baseline)
             print("JUDGE INFO length", len(questions))
             utilities.save_questions(questions, output_path)
 
@@ -1217,20 +1368,31 @@ def train_probes(seed, train_set_idxs, val_set_idxs, separated_head_wise_activat
     all_head_accs = []
     probes = []
 
-    all_X_train = np.concatenate([separated_head_wise_activations[i] for i in train_set_idxs], axis = 0)
-    all_X_val = np.concatenate([separated_head_wise_activations[i] for i in val_set_idxs], axis = 0)
-    y_train = np.concatenate([separated_labels[i] for i in train_set_idxs], axis = 0)
-    y_val = np.concatenate([separated_labels[i] for i in val_set_idxs], axis = 0)
+    # If val_set_idxs is None/empty, we do NOT use a validation set.
+    # In that case, we score heads on train accuracy (so the pipeline keeps working).
+    use_val = (val_set_idxs is not None) and (len(val_set_idxs) > 0)
+    if use_val:
+        print("==========TRAINING PROBES ON TRAIN + VAL SET=========")
+    else:
+        print("==========TRAINING PROBES ON TRAIN SET ONLY (no val)=========")
+
+    all_X_train = np.concatenate([separated_head_wise_activations[i] for i in train_set_idxs], axis=0)
+    y_train = np.concatenate([separated_labels[i] for i in train_set_idxs], axis=0)
+    if use_val:
+        all_X_eval = np.concatenate([separated_head_wise_activations[i] for i in val_set_idxs], axis=0)
+        y_eval = np.concatenate([separated_labels[i] for i in val_set_idxs], axis=0)
+    else:
+        all_X_eval = all_X_train
+        y_eval = y_train
     # print("==========SLICE=========", all_X_train.shape)
     for layer in tqdm(range(num_layers)): 
         for head in range(num_heads): 
             X_train = all_X_train[:,layer,head,:]
-            X_val = all_X_val[:,layer,head,:]
+            X_eval = all_X_eval[:, layer, head, :]
     
             clf = LogisticRegression(random_state=seed, max_iter=1000).fit(X_train, y_train)
-            y_pred = clf.predict(X_train)
-            y_val_pred = clf.predict(X_val)
-            all_head_accs.append(accuracy_score(y_val, y_val_pred))
+            y_eval_pred = clf.predict(X_eval)
+            all_head_accs.append(accuracy_score(y_eval, y_eval_pred))
             probes.append(clf)
 
     all_head_accs_np = np.array(all_head_accs)
@@ -1256,19 +1418,26 @@ def get_top_heads_pns(train_idxs, val_idxs, separated_head_wise_activations,  # 
     separated_labels, separated_head_wise_c, num_layers, num_heads, num_to_intervene=10, lambda_reg=1e-4, sigma_sq=1.0, seed=42, use_random_dir=False):
     print(len(separated_head_wise_activations))
     all_X_train = np.concatenate([separated_head_wise_activations[i] for i in train_idxs], axis = 0)
-    all_X_val = np.concatenate([separated_head_wise_activations[i] for i in val_idxs], axis = 0)
-
     c_train = torch.stack([x for i in train_idxs for x in separated_head_wise_c[i]])  # shape [2 * len(train_idxs), z_dim]
-    c_val = torch.stack([x for i in val_idxs for x in separated_head_wise_c[i]])
     y_train = np.concatenate([separated_labels[i] for i in train_idxs], axis = 0)
-    y_val = np.concatenate([separated_labels[i] for i in val_idxs], axis = 0)
-
-    all_X = np.concatenate([all_X_train, all_X_val], axis=0)
-    y_all = np.concatenate([y_train, y_val], axis=0)
+    
+    # Handle case where val_idxs is None or empty
+    if val_idxs is None or len(val_idxs) == 0:
+        print("Warning: val_idxs is None or empty. Using only training data.")
+        all_X = all_X_train
+        y_all = y_train
+        c_all = c_train
+    else:
+        all_X_val = np.concatenate([separated_head_wise_activations[i] for i in val_idxs], axis = 0)
+        c_val = torch.stack([x for i in val_idxs for x in separated_head_wise_c[i]])
+        y_val = np.concatenate([separated_labels[i] for i in val_idxs], axis = 0)
+        
+        all_X = np.concatenate([all_X_train, all_X_val], axis=0)
+        y_all = np.concatenate([y_train, y_val], axis=0)
+        c_all = torch.cat([c_train, c_val], dim=0)
 
     all_X = torch.tensor(all_X, dtype=torch.float32)       # [N_total, L, H, D]
     y_all = torch.tensor(y_all, dtype=torch.float32).unsqueeze(1)  # [N_total, 1]
-    c_all = torch.cat([c_train, c_val], dim=0)
 
 
     N, L, H, D = all_X.shape
@@ -1400,7 +1569,8 @@ def build_local_interventions_for_train_idx(
                                     v_global: dict = None, kappa=0.5, num_heads=32,
                                     use_special_direction=False, use_mat_direction=False,
                                     separated_head_wise_activations=None, separated_labels=None,
-                                    prompt_encodings=None):
+                                    prompt_encodings=None,
+                                    timing_stats: "TimingStats" = None):
     """
     Returns a dict: { layer_name: [(head, direction_vector, proj_val_std), ...] }
     direction_vector can be:
@@ -1443,6 +1613,7 @@ def build_local_interventions_for_train_idx(
                     separated_head_wise_activations=separated_head_wise_activations,
                     separated_labels=separated_labels,
                     prompt_encoding=prompt_encoding,  # Pass pre-encoded prompt
+                    timing_stats=timing_stats,
                 )
             except Exception as e:
                 print(f"Error in local_vec_from_train_idx for row {row_i}, layer {L}, head {head}: {e}")
@@ -1592,6 +1763,11 @@ def get_activations(labels, head_wise_activations, head_wise_c, dataset, model_n
         hate_path = f'/work/hdd/bcxt/yian3/toxic/features/{dataset}_texts.json'
         with open(hate_path) as f:
             data = [json.loads(line) for line in f]
+        sentences = pd.DataFrame(data)
+    elif dataset == 'paradetox':
+        paradetox_path = f'/work/hdd/bcxt/yian3/toxic/features/{dataset}_texts.json'
+        with open(paradetox_path, 'r') as f:
+            data = json.load(f)
         sentences = pd.DataFrame(data)
     else:
         sentences = pd.read_csv(f'./TruthfulQA/{dataset}.csv')

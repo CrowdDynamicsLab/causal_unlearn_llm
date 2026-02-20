@@ -18,6 +18,7 @@ Usage:
 """
 
 import os, json, argparse, numpy as np
+import time
 import torch
 from tqdm import tqdm, trange
 from typing import Dict, Any
@@ -30,12 +31,12 @@ import pandas as pd
 def load_data_like_validate_2fold(dataset_name):
     """Load data the same way as validate_2fold_toxic.py"""
     if dataset_name == "toxigen_vicuna":
-        toxigen_path = f'/work/hdd/bcxt/yian3/toxic/features/llama3_8B_{dataset_name}_texts.json'
+        toxigen_path = f'/work/hdd/bcxt/yian3/toxic/features/{dataset_name}_texts.json'
         with open(toxigen_path) as f:
             data = [json.loads(line) for line in f]
         df = pd.DataFrame(data)
     elif dataset_name == "hate_vicuna":
-        hate_path = f'/work/hdd/bcxt/yian3/toxic/features/llama3_8B_{dataset_name}_texts.json'
+        hate_path = f'/work/hdd/bcxt/yian3/toxic/features/{dataset_name}_texts.json'
         with open(hate_path) as f:
             data = [json.loads(line) for line in f]
         df = pd.DataFrame(data)
@@ -181,6 +182,7 @@ def main():
     ap.add_argument("--K", type=int, default=512)
     ap.add_argument("--batch_topk", type=int, default=2048)
     ap.add_argument("--device", default=None, choices=[None, "cpu", "cuda"])
+    ap.add_argument("--timing_knn", action="store_true", help="Print wall-clock time for top-K neighbor precompute (start/end timing)")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -221,11 +223,20 @@ def main():
 
     # Precompute top-K neighbors on non-toxic keys
     print(f"[topK] computing K={args.K} neighbors")
+    if args.timing_knn and args.device == "cuda" and torch.cuda.is_available():
+        # Best-effort sync for more meaningful wall-clock timing when CUDA is used.
+        torch.cuda.synchronize()
+    t0 = time.perf_counter() if args.timing_knn else None
     neighbors, sims = precompute_topk_neighbors(keys, K=args.K, batch=args.batch_topk, device=args.device)
+    if args.timing_knn and args.device == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t1 = time.perf_counter() if args.timing_knn else None
     np.save(os.path.join(args.out_dir, f"neighbors_top{args.K}.npy"), neighbors)
     np.save(os.path.join(args.out_dir, f"sims_top{args.K}.npy"), sims)
     print(f"[save] neighbors_top{args.K}.npy {neighbors.shape} int32")
     print(f"[save] sims_top{args.K}.npy {sims.shape} float16")
+    if args.timing_knn:
+        print(f"[timing] knn_precompute_sec: {t1 - t0:.6f} (N={keys.shape[0]}, K={args.K}, device={args.device})")
 
 if __name__ == "__main__":
     main()
@@ -235,5 +246,8 @@ if __name__ == "__main__":
 python build_topk_neighbors.py \
   --dataset toxigen_vicuna \
   --out_dir /work/hdd/bcxt/yian3/toxic/local_store_toxigen  \
-  --K 512
+  --K 256 \
+  --device cpu \
+  --timing_knn
+
 """
